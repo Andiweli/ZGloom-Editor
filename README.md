@@ -1,10 +1,10 @@
-# 🧱 ZGloom Editor
+# 🧱 Gloom Level Editor
 
-<p align="center">
-  <img alt="Status" src="https://img.shields.io/badge/status-prototype-orange?style=for-the-badge" />
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=for-the-badge" />
-  <img alt="IDE" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=for-the-badge" />
-  <img alt="Maps" src="https://img.shields.io/badge/maps-Gloom--compatible-brightgreen?style=for-the-badge" />
+<p align="left">
+  <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
+  <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
+  <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
+  <img alt="maps" src="https://img.shields.io/badge/maps-Gloom--compatible-brightgreen?style=flat" />
 </p>
 
 **ZGloom Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.
