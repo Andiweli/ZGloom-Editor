@@ -1,4 +1,4 @@
-# 🧱 Gloom Level Editor
+# 🧱 Gloom Level Editor [WIP]
 
 <p align="left">
   <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
