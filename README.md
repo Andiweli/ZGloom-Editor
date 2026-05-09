@@ -1,4 +1,4 @@
-# 🧱 ZGloom Editor [WiP]
+# 🧱 ZGloom Editor [Beta]
 
 <p align="left">
   <img alt="status" src="https://img.shields.io/badge/status-beta-orange?style=flat" />
@@ -10,7 +10,9 @@ The ZGloom Editor is a modern map editor for Gloom / Gloom Deluxe Amiga maps, fo
 
 It can load, inspect, edit, and save original Gloom map files, including walls, doors, switches, monsters, event zones, triggers, textures, and object preload data.
 
-<img width="1264" height="811" alt="gloomed" src="https://github.com/user-attachments/assets/9b1809c6-6a3f-4ee6-bdb8-3ebf4d0e817a" />
+[Here's a link to a video](https://vimeo.com/manage/videos/1190576772) where you can see how to create a new level and start playing ZGloom.
+
+<img width="1479" height="948" alt="image" src="https://github.com/user-attachments/assets/1015469c-bcca-4936-888c-e61dc685a850" />
 
 ---
 
