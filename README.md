@@ -1,62 +1,79 @@
-# 🧱 Gloom Level Editor [WiP]
+# 🧱 ZGloom Editor [WiP]
 
 <p align="left">
-  <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
+  <img alt="status" src="https://img.shields.io/badge/status-beta-orange?style=flat" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
   <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
 </p>
 
-**Gloom Level Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.
+The ZGloom Editor is a modern map editor for Gloom / Gloom Deluxe Amiga maps, focused on preserving compatibility with the original Amiga engine while making editing easier on modern systems.
 
-The goal is to provide a practical desktop tool for inspecting, editing and exporting map data while keeping the workflow close to the original Gloom/ZGloom structure.
+It can load, inspect, edit, and save original Gloom map files, including walls, doors, switches, monsters, event zones, triggers, textures, and object preload data.
 
 <img width="1264" height="811" alt="gloomed" src="https://github.com/user-attachments/assets/9b1809c6-6a3f-4ee6-bdb8-3ebf4d0e817a" />
 
 ---
 
-## ✨ Current editor features
+## 🛠️ Core Editing Features
 
-| Area | Features |
-| --- | --- |
-| 🗺️ **Map view** | Top-down 2D map view with selection support |
-| 🔍 **Inspector** | Selection and inspector panel for editing map elements |
-| 🎨 **Textures** | Texture preview panel for the selected zone |
-| 📦 **CrM2 support** | CrM2 texture loading from `txts/` |
-| 🧱 **Drawing tools** | Draw modes for walls, monster zones and event triggers |
-| 🧩 **Zone tools** | Zone list and zone edit dialog |
-| ⚙️ **Events** | Event editor and texture slot editor |
-| 💾 **Export** | Save, Save As and SVG export |
+The editor supports:
 
----
+- Loading and saving original Gloom map files
+- Drawing walls, doors, switches, and event zones
+- Editing existing wall zones and event trigger lines
+- Moving and modifying map geometry on a precise grid
+- 8×8 sub-grid snapping for accurate Amiga-style geometry
+- Support for very thin wall segments, including 1/8-width structures
+- Correct texture mapping on narrow wall faces
+- Selection feedback for walls, including visible zone IDs such as Z10, Z11, etc.
+- Texture selection for walls, doors, switches, and special surfaces
+- Previewing animated wall/switch textures correctly
 
-## 🖱️ Editing workflow
+## 🔗 Event and Trigger System
 
-The editor currently focuses on a clean **2D editing workflow**:
+The editor can work with Gloom’s event system, including:
 
-- select existing map elements
-- inspect and adjust zone data
-- preview assigned textures
-- draw walls, monster zones and event triggers
-- save edited maps or export the layout as SVG
+- Creating and editing event trigger zones
+- Linking event triggers to walls, doors, or switches
+- Dedicated support for switch/trigger texture linking
+- Preserving event command order where needed for Amiga compatibility
+- Handling doors, switches, and animated trigger behaviour
+- Keeping switch animation and door activation working correctly in-game
 
----
+## 👾 Monster and Object Support
 
-## 📁 Texture loading notes
+The editor supports monster placement and fixes important Amiga runtime requirements:
 
-Texture previews resolve files from the following locations:
+- Reading and writing monster spawn commands
+- Preserving monster positions
+- Repairing missing or broken object preload lists
+- Automatically generating a valid LoadObjects command when needed
+- Ensuring monsters appear correctly on real Amiga hardware instead of spawning outside the map
 
-1. `txts/` next to the editor project
-2. `txts/` next to the loaded map's parent folder
+## 🧩 Amiga Compatibility Fixes
 
-This keeps the editor flexible while still matching the expected Gloom-style data layout.
+A major goal of the editor is to save maps that work correctly on a real Amiga with Gloom Deluxe.
 
----
+It now includes fixes for:
 
-## 🚧 Prototype notes
+- Correct Amiga grid writing
+- Backface/reversed wall zones
+- Invisible-but-solid wall problems
+- Animated wall visibility on real hardware
+- Preserving original grid coverage where possible
+- Writing changed/new walls in a way the original engine can render correctly
+- Keeping ZGloom preview behaviour and real Amiga behaviour aligned as closely as possible
 
-- Mouse drawing currently supports **walls**, **monster zones** and **event triggers**.
-- Standalone map-object placement can be added next once the dedicated object layer is exposed in the editor data model.
-- The editor is currently a **Win32 / x86 Visual Studio prototype**.
+## ✨ Usability Features
+
+The editor also includes several workflow improvements:
+
+- Clear status bar guidance
+- Optimised grid rendering to avoid heavy slowdown
+- Clearer tool naming such as Wall/Door/Switch
+- Separate switch-linking workflow via Link Event > Switch/Trigger
+- Better visual feedback when selecting map elements
+- Right-side overview area showing selected wall/zone information
 
 ---
 
