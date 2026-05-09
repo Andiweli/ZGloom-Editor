@@ -6,6 +6,7 @@
 #define IDD_EVENT                       202
 #define IDD_COMMAND                     203
 #define IDD_MAPSETTINGS                 204
+#define IDD_EDITORSETTINGS              205
 
 #define IDC_ZONE_TYPE                   1001
 #define IDC_ZONE_X1                     1002
@@ -58,6 +59,15 @@
 #define IDC_TEX_5                       1306
 #define IDC_TEX_6                       1307
 #define IDC_TEX_7                       1308
+#define IDC_TEX_FOUND_LIST              1309
+#define IDC_TEX_FOUND_STATUS            1310
+#define IDC_TEX_PREVIEW                 1311
+#define IDC_TEX_PREVIEW_SCROLL          1312
+
+#define IDC_SETTINGS_TEXTURE_ROOT       1401
+#define IDC_SETTINGS_BROWSE             1402
+#define IDC_SETTINGS_CLEAR              1403
+#define IDC_SETTINGS_STATUS             1404
 
 #define IDC_ZONE_LIST                   2001
 #define IDC_CANVAS                      2002
@@ -70,6 +80,18 @@
 #define IDC_BTN_MOVE_DOWN               2009
 #define IDC_BTN_EVENTS                  2010
 #define IDC_BTN_TEXTURES                2011
+#define IDC_BTN_PLACE_ENEMY             2012
+#define IDC_BTN_PLACE_WEAPON            2013
+#define IDC_BTN_PLACE_PICKUP            2014
+#define IDC_BTN_PLAYER_START            2015
+#define IDC_BTN_LEVEL_END               2016
+#define IDC_BTN_LINK_EVENT              2017
+#define IDC_BTN_FLIP_DOOR_DIRECTION     2018
+#define IDC_BTN_LINK_ROTATE_CW           2019
+#define IDC_BTN_LINK_ROTATE_CCW          2020
+#define IDC_BTN_SET_TELEPORT_TARGET      2021
+#define IDC_BTN_LINK_SWITCH_TEXTURE      2022
+#define IDC_BTN_DELETE_LINK_EVENT        2023
 
 #define IDM_FILE_NEW                    40001
 #define IDM_FILE_OPEN                   40002
@@ -77,6 +99,14 @@
 #define IDM_FILE_SAVE_AS                40004
 #define IDM_FILE_EXPORT_SVG             40005
 #define IDM_FILE_EXIT                   40006
+#define IDM_FILE_CLOSE                  40022
+#define IDM_EDIT_LINK_EVENT             40023
+#define IDM_EDIT_FLIP_DOOR_DIRECTION    40024
+#define IDM_EDIT_LINK_ROTATE_CW          40025
+#define IDM_EDIT_LINK_ROTATE_CCW         40026
+#define IDM_EDIT_SET_TELEPORT_TARGET     40027
+#define IDM_EDIT_LINK_SWITCH_TEXTURE      40028
+#define IDM_EDIT_UNDO                   40018
 #define IDM_EDIT_ZONE                   40007
 #define IDM_EDIT_DELETE                 40008
 #define IDM_EDIT_MOVE_UP                40009
@@ -84,7 +114,12 @@
 #define IDM_INSERT_WALL                 40011
 #define IDM_INSERT_MONSTER_ZONE         40012
 #define IDM_INSERT_EVENT_TRIGGER        40013
+#define IDM_INSERT_PLAYER_START         40020
+#define IDM_INSERT_LEVEL_END            40021
 #define IDM_MAP_EVENTS                  40014
 #define IDM_MAP_TEXTURES                40015
 #define IDM_TOOLS_VALIDATE              40016
 #define IDM_HELP_ABOUT                  40017
+#define IDM_TOOLS_SETTINGS              40019
+#define IDM_FILE_RECENT_FIRST            40100
+#define IDM_FILE_RECENT_LAST             40104

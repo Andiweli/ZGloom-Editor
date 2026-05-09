@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -26,14 +27,6 @@ namespace
 
     void WriteBE16(std::vector<uint8_t>& out, uint16_t value)
     {
-        out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
-        out.push_back(static_cast<uint8_t>(value & 0xFF));
-    }
-
-    void WriteBE32(std::vector<uint8_t>& out, uint32_t value)
-    {
-        out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
-        out.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
         out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
         out.push_back(static_cast<uint8_t>(value & 0xFF));
     }
@@ -112,6 +105,9 @@ namespace
         return true;
     }
 
+    constexpr int kCollisionCellSize = 256;
+    constexpr double kFixedPointOne = 32766.0;
+
     int ClampCell(int value)
     {
         if (value < 0) return 0;
@@ -119,9 +115,111 @@ namespace
         return value;
     }
 
+    int ClampToInt16Value(int value)
+    {
+        if (value < -32768) return -32768;
+        if (value > 32767) return 32767;
+        return value;
+    }
+
     int WorldToCell(int value)
     {
-        return ClampCell(value / 1024);
+        // ZGloom/Gloom queries collision cells with x / 256 and z / 256.
+        // Use floor division for negative coordinates; C++ integer division truncates
+        // toward zero and would otherwise place negative walls into the wrong cell.
+        int cell = value / kCollisionCellSize;
+        if (value < 0 && (value % kCollisionCellSize) != 0)
+        {
+            --cell;
+        }
+        return ClampCell(cell);
+    }
+
+    void AddUniqueZoneIndex(std::vector<uint16_t>& indices, uint16_t zoneIndex)
+    {
+        if (std::find(indices.begin(), indices.end(), zoneIndex) == indices.end())
+        {
+            indices.push_back(zoneIndex);
+        }
+    }
+
+    bool SameGridRelevantZoneShape(const mapfmt::Zone& a, const mapfmt::Zone& b)
+    {
+        return a.ztype == b.ztype &&
+               a.x1 == b.x1 && a.z1 == b.z1 &&
+               a.x2 == b.x2 && a.z2 == b.z2;
+    }
+
+    bool ExactReverseWallPair(const mapfmt::Zone& a, const mapfmt::Zone& b)
+    {
+        return a.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+               b.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+               a.x1 == b.x2 && a.z1 == b.z2 &&
+               a.x2 == b.x1 && a.z2 == b.z1;
+    }
+
+    bool CollisionGridContainsZone(const std::array<mapfmt::MapDocument::CollisionPlane, 2>& grid, uint16_t zoneIndex)
+    {
+        for (const auto& plane : grid)
+        {
+            for (const auto& xColumn : plane)
+            {
+                for (const auto& cell : xColumn)
+                {
+                    if (std::find(cell.begin(), cell.end(), zoneIndex) != cell.end())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool CollisionGridLooksAmigaSafe(const std::array<mapfmt::MapDocument::CollisionPlane, 2>& grid, const std::vector<mapfmt::Zone>& zones)
+    {
+        // Older editor saves used a broad rectangle expansion for every wall and
+        // sometimes preserved only the front half of exact reverse/backface pairs.
+        // ZGloom's preview tolerates that, but real Gloom Deluxe appears to use
+        // the grid for render lookup as well; overcrowded cells or missing
+        // backfaces can become solid invisible walls. Shipped Amiga maps observed
+        // so far keep wall cell lists small, so suspicious grids are rebuilt.
+        constexpr size_t kMaxSafeWallCellEntries = 16;
+        for (const auto& xColumn : grid[0])
+        {
+            for (const auto& cell : xColumn)
+            {
+                if (cell.size() > kMaxSafeWallCellEntries)
+                {
+                    return false;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < zones.size(); ++i)
+        {
+            if (zones[i].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall))
+            {
+                continue;
+            }
+
+            for (size_t j = i + 1; j < zones.size(); ++j)
+            {
+                if (!ExactReverseWallPair(zones[i], zones[j]))
+                {
+                    continue;
+                }
+
+                const bool iInGrid = CollisionGridContainsZone(grid, static_cast<uint16_t>(i));
+                const bool jInGrid = CollisionGridContainsZone(grid, static_cast<uint16_t>(j));
+                if (iInGrid != jInGrid)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     std::string EscapeXml(const std::string& value)
@@ -145,6 +243,40 @@ namespace
 
 namespace mapfmt
 {
+    void RecalculateWallMetadata(Zone& zone)
+    {
+        if (zone.ztype != static_cast<int16_t>(ZoneType::Wall) &&
+            zone.ztype != static_cast<int16_t>(ZoneType::MonsterZone) &&
+            zone.ztype != static_cast<int16_t>(ZoneType::EventTrigger))
+        {
+            return;
+        }
+
+        int dx = static_cast<int>(zone.x2) - static_cast<int>(zone.x1);
+        int dz = static_cast<int>(zone.z2) - static_cast<int>(zone.z1);
+        double length = std::hypot(static_cast<double>(dx), static_cast<double>(dz));
+
+        if (length < 1.0)
+        {
+            // Avoid zero-length walls. A wall with ln=0 and zero normals is drawn
+            // by the editor, but it cannot collide in the engine.
+            zone.x2 = static_cast<int16_t>(ClampToInt16Value(static_cast<int>(zone.x1) + 1));
+            zone.z2 = zone.z1;
+            dx = static_cast<int>(zone.x2) - static_cast<int>(zone.x1);
+            dz = static_cast<int>(zone.z2) - static_cast<int>(zone.z1);
+            length = std::hypot(static_cast<double>(dx), static_cast<double>(dz));
+        }
+
+        const int normalX = ClampToInt16Value(static_cast<int>(std::lround((static_cast<double>(dx) / length) * kFixedPointOne)));
+        const int normalZ = ClampToInt16Value(static_cast<int>(std::lround((static_cast<double>(dz) / length) * kFixedPointOne)));
+
+        zone.na = static_cast<int16_t>(normalX);
+        zone.nb = static_cast<int16_t>(normalZ);
+        zone.a = static_cast<int16_t>(ClampToInt16Value(-normalZ));
+        zone.b = static_cast<int16_t>(normalX);
+        zone.ln = static_cast<int16_t>(ClampToInt16Value(static_cast<int>(std::lround(length))));
+    }
+
     std::string EventCommand::ToDisplayString() const
     {
         std::ostringstream os;
@@ -203,6 +335,19 @@ namespace mapfmt
             script.commands.clear();
         }
         animationBlock.clear();
+        animations.clear();
+        for (auto& plane : collisionGrid)
+        {
+            for (auto& xColumn : plane)
+            {
+                for (auto& cell : xColumn)
+                {
+                    cell.clear();
+                }
+            }
+        }
+        hasCollisionGrid = false;
+        originalZonesForGrid.clear();
         sourcePath.clear();
         dirty = false;
     }
@@ -283,6 +428,55 @@ namespace mapfmt
             zones.push_back(zone);
         }
 
+        for (auto& plane : collisionGrid)
+        {
+            for (auto& xColumn : plane)
+            {
+                for (auto& cell : xColumn)
+                {
+                    cell.clear();
+                }
+            }
+        }
+        hasCollisionGrid = false;
+        if (gridoff + (kGridSize * kGridSize * 8) <= raw.size())
+        {
+            bool gridOk = true;
+            for (int z = 0; z < kGridSize && gridOk; ++z)
+            {
+                for (int x = 0; x < kGridSize && gridOk; ++x)
+                {
+                    for (int plane = 0; plane < 2 && gridOk; ++plane)
+                    {
+                        const size_t cellOffset = gridoff + static_cast<size_t>((x + z * kGridSize) * 8 + plane * 4);
+                        const uint16_t storedCount = ReadBE16(raw.data() + cellOffset);
+                        const uint16_t storedOffset = ReadBE16(raw.data() + cellOffset + 2);
+                        const uint32_t count = static_cast<uint16_t>(storedCount + 1);
+                        if (count == 0)
+                        {
+                            continue;
+                        }
+                        const size_t listStart = polypnt + static_cast<size_t>(storedOffset) * 2;
+                        if (listStart + static_cast<size_t>(count) * 2 > raw.size())
+                        {
+                            gridOk = false;
+                            break;
+                        }
+                        for (uint32_t i = 0; i < count; ++i)
+                        {
+                            const uint16_t zoneIndex = ReadBE16(raw.data() + listStart + static_cast<size_t>(i) * 2);
+                            if (zoneIndex < zones.size())
+                            {
+                                collisionGrid[plane][x][z].push_back(zoneIndex);
+                            }
+                        }
+                    }
+                }
+            }
+            hasCollisionGrid = gridOk;
+        }
+        originalZonesForGrid = zones;
+
         for (auto& name : textureNames)
         {
             name.clear();
@@ -305,6 +499,7 @@ namespace mapfmt
         }
 
         animationBlock.clear();
+        animations.clear();
         if (animpnt != 0)
         {
             if (animpnt >= raw.size())
@@ -317,6 +512,9 @@ namespace mapfmt
             while ((animPos + 8) <= raw.size())
             {
                 const uint16_t frames = ReadBE16(raw.data() + animPos);
+                const uint16_t first = ReadBE16(raw.data() + animPos + 2);
+                const uint16_t delay = ReadBE16(raw.data() + animPos + 4);
+                const uint16_t current = ReadBE16(raw.data() + animPos + 6);
                 for (size_t i = 0; i < 8; ++i)
                 {
                     animationBlock.push_back(raw[animPos + i]);
@@ -326,6 +524,12 @@ namespace mapfmt
                 {
                     break;
                 }
+                AnimationEntry entry{};
+                entry.frames = frames;
+                entry.first = first;
+                entry.delay = delay;
+                entry.current = current;
+                animations.push_back(entry);
             }
         }
 
@@ -431,6 +635,95 @@ namespace mapfmt
         return true;
     }
 
+
+    int CountListValue(const std::vector<int16_t>& values, int16_t value)
+    {
+        return static_cast<int>(std::count(values.begin(), values.end(), value));
+    }
+
+    std::vector<int16_t> BuildRequiredLoadObjectList(const std::array<EventScript, MapDocument::kEventCount>& scripts)
+    {
+        std::vector<int16_t> required;
+        for (const auto& script : scripts)
+        {
+            for (const auto& command : script.commands)
+            {
+                if (command.type == CommandType::AddMonster)
+                {
+                    required.push_back(command.params[0]);
+                }
+            }
+        }
+        return required;
+    }
+
+    std::vector<int16_t> MergeLoadObjectListPreservingOriginalOrder(
+        const std::vector<int16_t>& existing,
+        const std::vector<int16_t>& required)
+    {
+        std::vector<int16_t> merged;
+        merged.reserve(required.size());
+
+        for (int16_t value : existing)
+        {
+            if (CountListValue(merged, value) < CountListValue(required, value))
+            {
+                merged.push_back(value);
+            }
+        }
+
+        // Older editor saves could lose the LoadObjects command entirely. The
+        // original Amiga engine still expects event 1 to preload every object
+        // type that later appears in AddMonster commands; otherwise enemies can
+        // instantiate from stale/invalid object slots and appear outside the map.
+        // Append missing entries in real spawn order while keeping shipped maps'
+        // existing preload order unchanged whenever possible.
+        for (int16_t value : required)
+        {
+            if (CountListValue(merged, value) < CountListValue(required, value))
+            {
+                merged.push_back(value);
+            }
+        }
+
+        return merged;
+    }
+
+    void NormalizeLoadObjectsForAmigaSave(std::array<EventScript, MapDocument::kEventCount>& scripts)
+    {
+        const std::vector<int16_t> required = BuildRequiredLoadObjectList(scripts);
+
+        std::vector<int16_t> existing;
+        for (const auto& script : scripts)
+        {
+            for (const auto& command : script.commands)
+            {
+                if (command.type == CommandType::LoadObjects)
+                {
+                    existing.insert(existing.end(), command.listValues.begin(), command.listValues.end());
+                }
+            }
+        }
+
+        for (auto& script : scripts)
+        {
+            script.commands.erase(std::remove_if(script.commands.begin(), script.commands.end(), [](const EventCommand& command)
+            {
+                return command.type == CommandType::LoadObjects;
+            }), script.commands.end());
+        }
+
+        if (required.empty())
+        {
+            return;
+        }
+
+        EventCommand loadCommand;
+        loadCommand.type = CommandType::LoadObjects;
+        loadCommand.listValues = MergeLoadObjectListPreservingOriginalOrder(existing, required);
+        scripts[0].commands.insert(scripts[0].commands.begin(), loadCommand);
+    }
+
     bool MapDocument::SaveToFile(const std::string& path, std::string& errorMessage) const
     {
         constexpr uint32_t headerSize = 20 + (kEventCount * 4);
@@ -443,50 +736,114 @@ namespace mapfmt
         };
 
         GridCell cells[2][kGridSize][kGridSize];
-        std::vector<uint16_t> polyList;
-        polyList.reserve(zones.size() * 16);
-
-        for (size_t zoneIndex = 0; zoneIndex < zones.size(); ++zoneIndex)
+        std::vector<Zone> saveZones = zones;
+        auto eventsToWrite = events;
+        NormalizeLoadObjectsForAmigaSave(eventsToWrite);
+        for (Zone& zone : saveZones)
         {
-            const Zone& zone = zones[zoneIndex];
-            const int xMin = std::min<int>(zone.x1, zone.x2);
-            const int xMax = std::max<int>(zone.x1, zone.x2);
-            const int zMin = std::min<int>(zone.z1, zone.z2);
-            const int zMax = std::max<int>(zone.z1, zone.z2);
-
-            const int cellX1 = WorldToCell(xMin);
-            const int cellX2 = WorldToCell(xMax);
-            const int cellZ1 = WorldToCell(zMin);
-            const int cellZ2 = WorldToCell(zMax);
-
-            int plane = -1;
-            if (zone.ztype == static_cast<int16_t>(ZoneType::Wall))
+            const bool lineZone = zone.ztype == static_cast<int16_t>(ZoneType::Wall) ||
+                zone.ztype == static_cast<int16_t>(ZoneType::MonsterZone) ||
+                zone.ztype == static_cast<int16_t>(ZoneType::EventTrigger);
+            if (lineZone &&
+                (zone.ln <= 0 || (zone.na == 0 && zone.nb == 0) || (zone.a == 0 && zone.b == 0)))
             {
-                plane = 0;
+                RecalculateWallMetadata(zone);
             }
-            else if (zone.ztype == static_cast<int16_t>(ZoneType::EventTrigger))
-            {
-                plane = 1;
-            }
+        }
 
-            if (plane >= 0)
+        auto addLineZoneToGrid = [&](int plane, const Zone& zone, uint16_t zoneIndex)
+        {
+            plane = std::max(0, std::min(1, plane));
+            const int dx = static_cast<int>(zone.x2) - static_cast<int>(zone.x1);
+            const int dz = static_cast<int>(zone.z2) - static_cast<int>(zone.z1);
+            const int steps = std::max(1, static_cast<int>(std::ceil(static_cast<double>(std::max(std::abs(dx), std::abs(dz))) / 64.0)));
+            for (int i = 0; i <= steps; ++i)
             {
-                for (int cz = cellZ1; cz <= cellZ2; ++cz)
+                const double t = static_cast<double>(i) / static_cast<double>(steps);
+                const int wx = static_cast<int>(std::lround(static_cast<double>(zone.x1) + static_cast<double>(dx) * t));
+                const int wz = static_cast<int>(std::lround(static_cast<double>(zone.z1) + static_cast<double>(dz) * t));
+                AddUniqueZoneIndex(cells[plane][WorldToCell(wx)][WorldToCell(wz)].zoneIndices, zoneIndex);
+            }
+        };
+
+        // Start with the original Amiga grid when available and sane. This grid is
+        // used by the original Gloom/Gloom Deluxe engine not only for
+        // blocking/collision, but also for visibility/render lookup. Preserve exact
+        // shipped cell coverage, but rebuild grids created by older editor builds
+        // when they are overcrowded or lost one half of exact backface pairs.
+        const bool preserveOriginalGrid = hasCollisionGrid &&
+            CollisionGridLooksAmigaSafe(collisionGrid, saveZones);
+
+        if (preserveOriginalGrid)
+        {
+            for (int plane = 0; plane < 2; ++plane)
+            {
+                for (int x = 0; x < kGridSize; ++x)
                 {
-                    for (int cx = cellX1; cx <= cellX2; ++cx)
+                    for (int z = 0; z < kGridSize; ++z)
                     {
-                        cells[plane][cx][cz].zoneIndices.push_back(static_cast<uint16_t>(zoneIndex));
+                        for (uint16_t zoneIndex : collisionGrid[plane][x][z])
+                        {
+                            if (zoneIndex < saveZones.size() &&
+                                zoneIndex < originalZonesForGrid.size() &&
+                                SameGridRelevantZoneShape(saveZones[zoneIndex], originalZonesForGrid[zoneIndex]))
+                            {
+                                AddUniqueZoneIndex(cells[plane][x][z].zoneIndices, zoneIndex);
+                            }
+                        }
                     }
                 }
             }
         }
+
+        for (size_t zoneIndex = 0; zoneIndex < saveZones.size(); ++zoneIndex)
+        {
+            const Zone& zone = saveZones[zoneIndex];
+            const bool originalGridAlreadyPreserved =
+                preserveOriginalGrid &&
+                zoneIndex < originalZonesForGrid.size() &&
+                SameGridRelevantZoneShape(zone, originalZonesForGrid[zoneIndex]);
+
+            if (originalGridAlreadyPreserved)
+            {
+                // The exact original cell coverage was copied above. Do not add an
+                // approximated, expanded coverage a second time: shipped maps use
+                // very specific wall/trigger/door cell ranges, and widening them
+                // changes real Amiga render/collision/trigger behaviour after a
+                // plain save.
+                continue;
+            }
+
+            if (zone.ztype == static_cast<int16_t>(ZoneType::Wall))
+            {
+                // Amiga-compatible export for new/edited walls. Do not use the
+                // old broad rectangle expansion here: it can put 20+ walls into a
+                // single small-map cell, while original Amiga maps commonly keep
+                // wall lists very small. Real Gloom Deluxe then may skip render
+                // entries while collision still blocks. Follow the line itself and
+                // include exact reverse/backface zones as their own entries.
+                addLineZoneToGrid(0, zone, static_cast<uint16_t>(zoneIndex));
+                continue;
+            }
+
+            if (zone.ztype == static_cast<int16_t>(ZoneType::MonsterZone) ||
+                zone.ztype == static_cast<int16_t>(ZoneType::EventTrigger))
+            {
+                // Trigger/monster helper lines also follow the line itself. Keeping
+                // them narrow avoids firing doors/exits from neighbouring cells.
+                addLineZoneToGrid(1, zone, static_cast<uint16_t>(zoneIndex));
+            }
+        }
+
+        std::vector<uint16_t> polyList;
+        polyList.reserve(saveZones.size() * 32);
 
         std::vector<uint8_t> out;
         out.resize(headerSize, 0);
 
         const uint32_t gridoff = headerSize;
         const uint32_t polyoff = gridoff + gridBytes;
-        const uint32_t polypnt = polyoff + static_cast<uint32_t>(zones.size() * kZoneSize);
+        const uint32_t polypnt = polyoff + static_cast<uint32_t>(saveZones.size() * kZoneSize);
 
         WriteBE32At(out, 0, gridoff);
         WriteBE32At(out, 4, polyoff);
@@ -494,7 +851,7 @@ namespace mapfmt
 
         out.resize(polyoff, 0);
 
-        for (const Zone& zone : zones)
+        for (const Zone& zone : saveZones)
         {
             WriteBE16(out, static_cast<uint16_t>(zone.ztype));
             WriteBE16(out, static_cast<uint16_t>(zone.x1));
@@ -521,6 +878,11 @@ namespace mapfmt
                 for (int x = 0; x < kGridSize; ++x)
                 {
                     auto& cell = cells[plane][x][z];
+                    if (cell.zoneIndices.size() > 0x10000u || polyList.size() > 0xFFFFu)
+                    {
+                        errorMessage = "Collision grid is too large for the original 16-bit map format.";
+                        return false;
+                    }
                     cell.polyOffset = static_cast<uint16_t>(polyList.size());
                     polyList.insert(polyList.end(), cell.zoneIndices.begin(), cell.zoneIndices.end());
                 }
@@ -573,7 +935,7 @@ namespace mapfmt
         for (int eventIndex = 0; eventIndex < kEventCount; ++eventIndex)
         {
             eventOffsets[eventIndex] = static_cast<uint32_t>(out.size());
-            const auto& commands = events[eventIndex].commands;
+            const auto& commands = eventsToWrite[eventIndex].commands;
             for (const auto& cmd : commands)
             {
                 WriteBE16(out, static_cast<uint16_t>(cmd.type));
@@ -640,6 +1002,13 @@ namespace mapfmt
             {
                 issues.push_back("Zone " + std::to_string(i) + " references an event outside 0..24.");
             }
+            if (zone.ztype == static_cast<int16_t>(ZoneType::Wall))
+            {
+                if (zone.ln <= 0 || (zone.na == 0 && zone.nb == 0) || (zone.a == 0 && zone.b == 0))
+                {
+                    issues.push_back("Zone " + std::to_string(i) + " is a wall but has missing collision metadata; it will be recalculated on save.");
+                }
+            }
             for (size_t t = 0; t < zone.textures.size(); ++t)
             {
                 if (zone.textures[t] > 159)
@@ -662,6 +1031,18 @@ namespace mapfmt
                         issues.push_back("Event " + std::to_string(ev + 1) + ", command " + std::to_string(cmdIndex + 1) + " references a zone index outside the map.");
                     }
                 }
+            }
+        }
+
+        for (const auto& anim : animations)
+        {
+            if (anim.frames == 0)
+            {
+                continue;
+            }
+            if (anim.first >= 160 || anim.Last() >= 160)
+            {
+                issues.push_back("Animation texture range " + std::to_string(anim.first) + ".." + std::to_string(anim.Last()) + " is outside 0..159.");
             }
         }
 
@@ -743,14 +1124,9 @@ namespace mapfmt
             }
             else
             {
-                const int x = std::min<int>(zone.x1, zone.x2);
-                const int y = std::min<int>(zone.z1, zone.z2);
-                const int w = std::max<int>(1, std::abs(zone.x2 - zone.x1));
-                const int h = std::max<int>(1, std::abs(zone.z2 - zone.z1));
-                const char* fill = (zone.ztype == static_cast<int16_t>(ZoneType::MonsterZone)) ? "#2ea04355" : "#ff4d4d55";
                 const char* stroke = (zone.ztype == static_cast<int16_t>(ZoneType::MonsterZone)) ? "#2ea043" : "#ff4d4d";
-                file << "<rect x=\"" << x << "\" y=\"" << y << "\" width=\"" << w << "\" height=\"" << h
-                     << "\" fill=\"" << fill << "\" stroke=\"" << stroke << "\" stroke-width=\"16\"/>\n";
+                file << "<line x1=\"" << zone.x1 << "\" y1=\"" << zone.z1 << "\" x2=\"" << zone.x2 << "\" y2=\"" << zone.z2
+                     << "\" stroke=\"" << stroke << "\" stroke-width=\"20\" stroke-dasharray=\"48,32\"/>\n";
             }
             file << "<text x=\"" << std::min<int>(zone.x1, zone.x2) << "\" y=\"" << std::min<int>(zone.z1, zone.z2) - 16
                  << "\" fill=\"#ffffff\" font-family=\"Segoe UI, Arial\" font-size=\"96\">Z" << i << " E" << zone.ev << "</text>\n";

@@ -98,6 +98,9 @@
   <ItemGroup>
     <ResourceCompile Include="src\Editor.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <Image Include="src\app.ico" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

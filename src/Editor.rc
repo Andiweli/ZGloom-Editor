@@ -1,5 +1,8 @@
 #include <windows.h>
+#include <commctrl.h>
 #include "resource.h"
+
+IDI_APP_ICON ICON "app.ico"
 
 IDD_ZONE DIALOGEX 0, 0, 244, 206
 STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -103,27 +106,34 @@ BEGIN
     PUSHBUTTON    "Cancel", IDCANCEL, 186, 158, 56, 14
 END
 
-IDD_MAPSETTINGS DIALOGEX 0, 0, 238, 176
+IDD_MAPSETTINGS DIALOGEX 0, 0, 360, 306
 STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Texture Slots"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT       "T0", -1, 8, 10, 14, 10
-    EDITTEXT    IDC_TEX_0, 28, 8, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T1", -1, 8, 28, 14, 10
-    EDITTEXT    IDC_TEX_1, 28, 26, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T2", -1, 8, 46, 14, 10
-    EDITTEXT    IDC_TEX_2, 28, 44, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T3", -1, 8, 64, 14, 10
-    EDITTEXT    IDC_TEX_3, 28, 62, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T4", -1, 8, 82, 14, 10
-    EDITTEXT    IDC_TEX_4, 28, 80, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T5", -1, 8, 100, 14, 10
-    EDITTEXT    IDC_TEX_5, 28, 98, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T6", -1, 8, 118, 14, 10
-    EDITTEXT    IDC_TEX_6, 28, 116, 150, 12, ES_AUTOHSCROLL
-    LTEXT       "T7", -1, 8, 136, 14, 10
-    EDITTEXT    IDC_TEX_7, 28, 134, 150, 12, ES_AUTOHSCROLL
-    DEFPUSHBUTTON "OK", IDOK, 178, 134, 50, 14
-    PUSHBUTTON    "Cancel", IDCANCEL, 178, 152, 50, 14
+    LTEXT       "Found in texture folder", -1, 8, 8, 160, 10
+    CONTROL     "", IDC_TEX_FOUND_LIST, "SysListView32", WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS, 8, 24, 344, 104
+    LTEXT       "", IDC_TEX_FOUND_STATUS, 8, 132, 344, 22
+
+    LTEXT       "Selected texture preview / manual animation", -1, 8, 160, 260, 10
+    CONTROL     "", IDC_TEX_PREVIEW, "STATIC", WS_BORDER | SS_OWNERDRAW | SS_NOTIFY, 8, 174, 344, 82
+    CONTROL     "", IDC_TEX_PREVIEW_SCROLL, "STATIC", WS_TABSTOP | SS_NOTIFY, 8, 260, 344, 8
+
+    DEFPUSHBUTTON "OK", IDOK, 242, 284, 50, 14
+    PUSHBUTTON    "Cancel", IDCANCEL, 302, 284, 50, 14
+END
+
+IDD_EDITORSETTINGS DIALOGEX 0, 0, 332, 132
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Editor Settings"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT       "Texture/game data folder", -1, 8, 10, 104, 10
+    EDITTEXT    IDC_SETTINGS_TEXTURE_ROOT, 8, 24, 238, 14, ES_AUTOHSCROLL
+    PUSHBUTTON  "Browse...", IDC_SETTINGS_BROWSE, 252, 23, 70, 15
+    PUSHBUTTON  "Clear", IDC_SETTINGS_CLEAR, 252, 43, 70, 15
+    LTEXT       "Choose the Gloom data folder containing txts, or choose the txts folder itself. Used for new maps, wall textures, floor textures and roof textures.", -1, 8, 46, 238, 32
+    LTEXT       "", IDC_SETTINGS_STATUS, 8, 84, 314, 20
+    DEFPUSHBUTTON "OK", IDOK, 204, 110, 56, 14
+    PUSHBUTTON    "Cancel", IDCANCEL, 266, 110, 56, 14
 END

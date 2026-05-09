@@ -56,6 +56,24 @@ namespace mapfmt
         std::vector<EventCommand> commands;
     };
 
+    struct AnimationEntry
+    {
+        uint16_t frames = 0;
+        uint16_t first = 0;
+        uint16_t delay = 0;
+        uint16_t current = 0;
+
+        bool Contains(int textureIndex) const
+        {
+            return frames > 0 && textureIndex >= static_cast<int>(first) && textureIndex < static_cast<int>(first + frames);
+        }
+
+        int Last() const
+        {
+            return frames == 0 ? static_cast<int>(first) : static_cast<int>(first + frames - 1);
+        }
+    };
+
     struct Bounds
     {
         int32_t minX = 0;
@@ -64,6 +82,8 @@ namespace mapfmt
         int32_t maxZ = 1024;
         bool valid = false;
     };
+
+    void RecalculateWallMetadata(Zone& zone);
 
     class MapDocument
     {
@@ -84,6 +104,12 @@ namespace mapfmt
         std::array<std::string, kTextureSlotCount> textureNames;
         std::array<EventScript, kEventCount> events;
         std::vector<uint8_t> animationBlock;
+        std::vector<AnimationEntry> animations;
+        using CollisionCell = std::vector<uint16_t>;
+        using CollisionPlane = std::array<std::array<CollisionCell, kGridSize>, kGridSize>;
+        std::array<CollisionPlane, 2> collisionGrid{};
+        bool hasCollisionGrid = false;
+        std::vector<Zone> originalZonesForGrid;
 
         std::string sourcePath;
         bool dirty = false;
