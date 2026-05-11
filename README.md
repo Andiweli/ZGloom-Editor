@@ -1,18 +1,30 @@
-ZGloom Editor
-=============
+# 🧱 ZGloom Editor
 
-Standalone Win32 / x86 Visual Studio editor prototype for Gloom-compatible maps.
+<p align="left">
+  <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
+  <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
+  <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
 
-Current editor features:
-- top-down 2D map view
-- selection + inspector panel
-- texture preview panel for the selected zone
-- CrM2 texture loading from txts/
-- draw modes for walls, monster zones and event triggers
-- zone list, zone edit dialog, event editor and texture slot editor
-- save / save as / SVG export
+</p>
 
-Notes:
-- Texture preview resolves files from txts/ next to the project or next to the loaded map's parent folder.
-- Mouse drawing currently supports walls, monster zones and event triggers.
-- Standalone map-object placement can be added next once the dedicated object layer is exposed in the editor data model.
+**Gloom Level Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.  
+The goal is to provide a practical desktop tool for inspecting, editing and exporting map data while keeping the workflow close to the original Gloom/ZGloom structure.  
+
+> [!NOTE]
+> Built with AI-assisted development support for faster debugging, map-format analysis, and Amiga compatibility work.  
+
+<p align="center">
+<img width="800" height="440" alt="image" src="https://github.com/user-attachments/assets/c5f2c34b-3fd1-40c7-b9e6-f45c25f5d427" />
+</p>
+
+---
+
+## 🕹️ About Gloom
+
+**Gloom** is a classic Amiga first-person shooter. This editor is intended as a modern helper tool for working with Gloom-compatible map data in the context of ZGloom-related development.
+
+---
+
+## 🛠️ Project status
+
+This project is still in active prototype state. Features, file formats and editing behaviour may change while the editor evolves.
