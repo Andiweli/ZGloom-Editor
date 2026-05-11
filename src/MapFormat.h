@@ -23,6 +23,7 @@ namespace mapfmt
         LoadObjects = 4,
         ChangeTexture = 5,
         RotatePoly = 6,
+        UnknownRaw = -32768,
     };
 
     struct Zone
@@ -47,6 +48,8 @@ namespace mapfmt
         CommandType type = CommandType::AddMonster;
         std::array<int16_t, 5> params{};
         std::vector<int16_t> listValues;
+        int16_t rawOpcode = 0;
+        uint32_t rawByteCount = 0;
 
         std::string ToDisplayString() const;
     };
@@ -54,6 +57,8 @@ namespace mapfmt
     struct EventScript
     {
         std::vector<EventCommand> commands;
+        bool hasUnsupportedRaw = false;
+        std::vector<uint8_t> rawBytes;
     };
 
     struct AnimationEntry

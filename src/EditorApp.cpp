@@ -6,6 +6,7 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <richedit.h>
 #include <shlobj.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <cctype>
 #include <cwctype>
+#include <cwchar>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -71,6 +73,10 @@ namespace
     constexpr int kLevelEndEventValue = 24;
     constexpr UINT kRecentFileBaseId = 40100;
     constexpr UINT kCmdLinkEnemyObjects = 65010; // local toolbar/menu command; keeps resource.h unchanged
+    constexpr UINT kCmdLinkMoveWallGroup = 65011; // local toolbar/menu command; keeps resource.h unchanged
+    constexpr UINT kCmdToolbarScrollUp = 65012; // local toolbar scroll command; keeps resource.h unchanged
+    constexpr UINT kCmdToolbarScrollDown = 65013; // local toolbar scroll command; keeps resource.h unchanged
+    constexpr UINT kCmdViewEventGraphOverlay = 65014; // local view toggle; keeps resource.h unchanged
 
     enum class InsertMode
     {
@@ -87,6 +93,7 @@ namespace
         DeleteLinkEventToEnemyObject,
         LinkEventToRotateClockwise,
         LinkEventToRotateCounterClockwise,
+        LinkEventToMoveWallGroup,
         SetTeleportTarget,
     };
 
@@ -197,6 +204,62 @@ namespace
         }
     };
 
+    enum class GameProfileKind
+    {
+        Unknown,
+        Gloom,
+        GloomDeluxe,
+        Gloom3,
+        ZombieMassacre,
+    };
+
+    struct GameProfile
+    {
+        GameProfileKind kind = GameProfileKind::Unknown;
+        std::wstring title = L"Unknown Game";
+        std::string rootPath;
+        std::string mapFolder = "maps";
+        std::string objectFolder = "objs";
+        std::string imageFolder = "pics";
+        std::string soundFolder = "sfxs";
+        std::string scriptPath = "misc/script";
+
+        bool IsKnown() const
+        {
+            return kind != GameProfileKind::Unknown;
+        }
+    };
+
+    struct MapValidationReportSections
+    {
+        std::wstring profile;
+        std::wstring intelligence;
+        std::wstring checks;
+        std::wstring suggestions;
+        std::wstring technical;
+        std::wstring full;
+        std::vector<int> safeNeutralGuideZones;
+        int okCount = 0;
+        int infoCount = 0;
+        int warnCount = 0;
+        int saveWarnCount = 0;
+
+        bool HasSafeRepairs() const
+        {
+            return !safeNeutralGuideZones.empty();
+        }
+
+        bool HasWarnings() const
+        {
+            return warnCount > 0;
+        }
+
+        bool HasSaveWarnings() const
+        {
+            return saveWarnCount > 0;
+        }
+    };
+
     struct AppState
     {
         HINSTANCE instance = nullptr;
@@ -228,9 +291,17 @@ namespace
         HWND btnLinkEnemyObjects = nullptr;
         HWND btnLinkRotateCW = nullptr;
         HWND btnLinkRotateCCW = nullptr;
+        HWND btnLinkMoveWallGroup = nullptr;
         HWND btnDeleteLinkEvent = nullptr;
         HWND btnSetTeleportTarget = nullptr;
         HWND btnFlipDoorDirection = nullptr;
+        HWND btnValidateMap = nullptr;
+        HWND btnToolbarScrollUp = nullptr;
+        HWND btnToolbarScrollDown = nullptr;
+        HWND lineValidateTop = nullptr;
+        int toolbarScrollY = 0;
+        int toolbarScrollMaxY = 0;
+        bool toolbarScrollMode = false;
         HWND lineZonesLeft = nullptr;
         HWND labelZones = nullptr;
         HWND lineZonesRight = nullptr;
@@ -247,6 +318,8 @@ namespace
         HWND labelMapMarkers = nullptr;
         HWND lineMapMarkersRight = nullptr;
         mapfmt::MapDocument document;
+        GameProfile gameProfile;
+        bool showEventGraphOverlay = false;
         int selectedZone = -1;
         MonsterSpawnSelection selectedMonsterSpawn{};
         TeleportSelection selectedTeleportTarget{};
@@ -282,6 +355,13 @@ namespace
         int pendingSwitchTextureEventIndex = -1;
         int pendingSwitchTextureIndex = -1;
         bool pendingSwitchTextureValid = false;
+        int pendingMoveWallGroupSourceZone = -1;
+        bool pendingMoveWallGroupTargetPlacementActive = false;
+        int pendingMoveWallGroupGuideFirst = -1;
+        int pendingMoveWallGroupGuideCount = 0;
+        POINT pendingMoveWallGroupSourcePickWorld{};
+        POINT pendingMoveWallGroupTargetPickWorld{};
+        POINT pendingMoveWallGroupTargetOffset{};
         bool teleportTargetAwaitDirection = false;
         POINT teleportTargetWorld{};
         int teleportTargetRotation = 0;
@@ -290,6 +370,14 @@ namespace
         InsertMode insertMode = InsertMode::None;
         bool isDrawing = false;
         bool isPanning = false;
+        bool monsterSpawnDragging = false;
+        bool monsterSpawnDragMoved = false;
+        bool monsterSpawnDragSnapshotTaken = false;
+        MonsterSpawnSelection monsterSpawnDragSelection{};
+        POINT monsterSpawnDragStartClient{};
+        POINT monsterSpawnDragStartWorld{};
+        int monsterSpawnDragStartX = 0;
+        int monsterSpawnDragStartZ = 0;
         bool drawWallAngleLock = false;
         bool drawWallLengthSnapLock = false;
         bool viewInitialized = false;
@@ -328,6 +416,9 @@ namespace
     constexpr COLORREF kDarkMutedText = RGB(130, 130, 140);
     constexpr COLORREF kDarkLinkText = RGB(105, 170, 255);
     constexpr COLORREF kDarkBorder = RGB(78, 78, 88);
+    constexpr COLORREF kValidationOkText = RGB(92, 214, 132);
+    constexpr COLORREF kValidationInfoText = RGB(246, 211, 84);
+    constexpr COLORREF kValidationWarnText = RGB(255, 105, 105);
 
     HBRUSH DarkWindowBrush()
     {
@@ -543,6 +634,39 @@ namespace
         if (oldPen) SelectObject(hdc, oldPen);
         DeleteObject(pen);
 
+        const int controlId = GetDlgCtrlID(draw->hwndItem);
+        if (controlId == static_cast<int>(kCmdToolbarScrollUp) || controlId == static_cast<int>(kCmdToolbarScrollDown))
+        {
+            const bool up = controlId == static_cast<int>(kCmdToolbarScrollUp);
+            RECT iconRc = rc;
+            if (pressed) OffsetRect(&iconRc, 1, 1);
+            const int cx = (iconRc.left + iconRc.right) / 2;
+            const int cy = (iconRc.top + iconRc.bottom) / 2;
+            POINT tri[3]{};
+            if (up)
+            {
+                tri[0] = POINT{ cx, cy - 5 };
+                tri[1] = POINT{ cx - 6, cy + 4 };
+                tri[2] = POINT{ cx + 6, cy + 4 };
+            }
+            else
+            {
+                tri[0] = POINT{ cx - 6, cy - 4 };
+                tri[1] = POINT{ cx + 6, cy - 4 };
+                tri[2] = POINT{ cx, cy + 5 };
+            }
+            HBRUSH arrowBrush = CreateSolidBrush(text);
+            HBRUSH oldArrowBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, arrowBrush));
+            HPEN arrowPen = CreatePen(PS_SOLID, 1, text);
+            HPEN oldArrowPen = reinterpret_cast<HPEN>(SelectObject(hdc, arrowPen));
+            Polygon(hdc, tri, 3);
+            if (oldArrowPen) SelectObject(hdc, oldArrowPen);
+            if (oldArrowBrush) SelectObject(hdc, oldArrowBrush);
+            DeleteObject(arrowPen);
+            DeleteObject(arrowBrush);
+            return true;
+        }
+
         wchar_t textBuf[256]{};
         GetWindowTextW(draw->hwndItem, textBuf, static_cast<int>(ARRAYSIZE(textBuf)));
         HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT)));
@@ -673,14 +797,46 @@ namespace
             text = buf;
         }
 
-        HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT)));
+        HFONT defaultFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HFONT boldFont = nullptr;
+        LOGFONTW lf{};
+        if (defaultFont && GetObjectW(defaultFont, sizeof(lf), &lf) == sizeof(lf))
+        {
+            lf.lfWeight = FW_BOLD;
+            boldFont = CreateFontIndirectW(&lf);
+        }
+
+        HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, defaultFont));
         SetBkMode(hdc, TRANSPARENT);
+
+        std::wstring gameTitle = g_app.gameProfile.title.empty() ? L"Unknown Game" : g_app.gameProfile.title;
+        RECT gameRc = rc;
+        gameRc.left += 8;
+        gameRc.right -= 10;
+        int gameWidth = 0;
+        if (!gameTitle.empty())
+        {
+            HFONT oldGameFont = reinterpret_cast<HFONT>(SelectObject(hdc, boldFont ? boldFont : defaultFont));
+            SIZE gameSize{};
+            GetTextExtentPoint32W(hdc, gameTitle.c_str(), static_cast<int>(gameTitle.size()), &gameSize);
+            gameWidth = gameSize.cx + 18;
+            gameRc.left = std::max(gameRc.left, gameRc.right - gameWidth);
+            SetTextColor(hdc, RGB(255, 255, 255));
+            DrawTextW(hdc, gameTitle.c_str(), -1, &gameRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(hdc, oldGameFont);
+            SelectObject(hdc, defaultFont);
+        }
+
         SetTextColor(hdc, kDarkMutedText);
         RECT textRc = rc;
         textRc.left += 8;
-        textRc.right -= 8;
-        DrawTextW(hdc, text.c_str(), -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        textRc.right -= std::max(8, gameWidth + 12);
+        if (textRc.right > textRc.left + 20)
+        {
+            DrawTextW(hdc, text.c_str(), -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
         if (oldFont) SelectObject(hdc, oldFont);
+        if (boldFont) DeleteObject(boldFont);
     }
 
     LRESULT CALLBACK DarkStatusBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -699,8 +855,20 @@ namespace
         }
         case WM_SETTEXT:
         {
-            const LRESULT result = g_app.statusBarOldProc ? CallWindowProcW(g_app.statusBarOldProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
-            InvalidateRect(hwnd, nullptr, TRUE);
+            // Keep the status bar fully owner-painted. Letting the native status
+            // control repaint its own text caused stale game-title remnants after
+            // horizontal window resizes.
+            g_app.statusText = lParam ? reinterpret_cast<LPCWSTR>(lParam) : L"";
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            return TRUE;
+        }
+        case WM_SIZE:
+        case WM_WINDOWPOSCHANGED:
+        {
+            const LRESULT result = g_app.statusBarOldProc
+                ? CallWindowProcW(g_app.statusBarOldProc, hwnd, msg, wParam, lParam)
+                : DefWindowProcW(hwnd, msg, wParam, lParam);
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
             return result;
         }
         case WM_NCDESTROY:
@@ -745,10 +913,12 @@ namespace
     };
 
     void RefreshStatus();
+    void RefreshGameProfile();
     void ShowAboutDialog(HWND owner);
     void ShowEditorSettingsDialog();
     void InvalidateEditorViews();
     void InvalidateEditorViewsIncludingWalkPreview();
+    bool ShouldShowWalkPreview(const RECT& panelRc);
     RECT GetWalkPreviewRect(const RECT& panelRc);
     RECT GetWalkPreviewControlsRect(const RECT& panelRc);
     void InvalidateWalkPreview();
@@ -779,7 +949,10 @@ namespace
     std::string JoinPath(const std::string& base, const std::string& leaf);
     std::string TrimTrailingSlashes(std::string path);
     bool DirectoryExistsLocal(const std::string& path);
+    bool FileExistsLocal(const std::string& path);
     std::string BaseNameNoSlash(const std::string& path);
+    GameProfile DetectGameProfileForMapPath(const std::string& path);
+    std::wstring BuildMapValidationReport();
     bool ReadFileBinaryLocal(const std::string& path, std::vector<uint8_t>& data);
     bool LoadMaybeCrmLocal(const std::string& path, std::vector<uint8_t>& out, std::string& error);
     bool ResolveTexturePath(const std::string& textureName, std::string& outPath);
@@ -803,7 +976,9 @@ namespace
     void EnsureBackfaceForWallAtIndex(int zoneIndex);
     POINT WorldToScreen(const RECT& rc, const mapfmt::Bounds& bounds, int x, int z);
     POINT ScreenToWorldPrecise(const RECT& rc, const mapfmt::Bounds& bounds, int sx, int sy);
+    POINT ScreenToWorld(const RECT& rc, const mapfmt::Bounds& bounds, int sx, int sy);
     POINT ApplyWallEndpointSnap(const RECT& rc, POINT worldPoint);
+    POINT SnapWorldPointToFineGrid(POINT point);
     POINT ConstrainWallEndpoint45(POINT start, POINT current);
     POINT PrepareWallDrawEndpoint(const RECT& rc, POINT rawPoint);
     POINT PrepareLineZoneDrawEndpoint(POINT rawPoint);
@@ -904,11 +1079,23 @@ namespace
     int GetActiveSwitchTextureTriggerZone();
     bool PersistActiveSwitchTextureChoiceToTrigger(int triggerZoneIndex);
     bool PersistActiveSwitchTextureChoiceForCurrentContext();
+    std::wstring EventSlotRoleText(int eventIndex);
+    std::wstring EventSlotComboLabel(int eventIndex);
+    bool EventScriptHasAdvancedRaw(int eventIndex);
+    bool WarnIfEventScriptAdvancedRaw(int eventIndex);
     std::wstring FormatEventLogicSummaryForZone(int zoneIndex);
+    std::wstring FormatSelectedZoneValidationSummary(int zoneIndex);
+    MapValidationReportSections BuildMapValidationReportSections();
+    bool ApplySafeValidationRepairsNoPrompt(const MapValidationReportSections& sections, bool pushUndoSnapshot);
+    bool ConfirmSaveWithValidationAndMaybeFixes(const std::string& path);
+    void DrawEventGraphOverlay(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds);
     void DrawEventLogicOverlay(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds);
+    void DrawMoveWallGroupEventPaths(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, int eventIndex);
+    void DrawAllMoveWallGroupEventPaths(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds);
     int FindAvailableEventSlotForTrigger(int triggerZoneIndex);
     int EnsureTriggerHasEventSlot(int triggerZoneIndex);
     bool AddOpenDoorLinkToEvent(int eventIndex, int targetZoneIndex);
+    bool AddMoveWallGroupLinkToEvent(int eventIndex, int sourceZoneIndex, int guideZoneIndex, int& targetZoneIndex);
     bool AddSwitchTextureLinkToEvent(int eventIndex, int targetZoneIndex);
     bool IsZoneControlledByOpenDoor(int zoneIndex);
     void FlipSelectedDoorDirection();
@@ -920,18 +1107,44 @@ namespace
     bool CanDeleteSelectedEventLink();
     bool DeleteSelectedEventLink();
     void StartLinkEventToRotateTool(bool clockwise);
+    void StartLinkEventToMoveWallGroupTool();
     void StartSetTeleportTargetTool();
+    void ResetPendingMoveWallGroup();
+    void MakeMoveWallGroupGuideAiNeutral(mapfmt::Zone& guide);
+    bool BeginMoveWallGroupTargetPlacement(int targetZoneIndex, POINT pickWorld);
+    bool UpdateMoveWallGroupTargetPlacement(POINT world);
+    bool CommitMoveWallGroupTargetPlacement(POINT world);
+    void DrawMoveWallGroupPlacementPreview(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds);
     void ResetPendingTeleportTarget();
     bool FinishLinkEventToZone(int targetZoneIndex);
     bool FinishLinkEventToSwitchTexture(int targetZoneIndex);
     bool FinishLinkEventToEnemyObject(const MonsterSpawnSelection& targetSpawn);
     bool FinishDeleteLinkEventToEnemyObject(const MonsterSpawnSelection& targetSpawn);
     bool FinishLinkEventToRotate(int targetZoneIndex);
+    bool FinishLinkEventToMoveWallGroup(int targetZoneIndex);
     bool PointsTouchForRotateRun(const mapfmt::Zone& a, const mapfmt::Zone& b);
     bool IsCanonicalRotateWallIndex(int zoneIndex);
+    void CollectCanonicalRotateWallComponent(int targetZoneIndex, std::vector<int>& outFronts);
     void DetectConsecutiveRotatingRun(int targetZoneIndex, int& firstZoneIndex, int& zoneCount);
-    struct RotateWallRunInfo;
+    struct RotateWallRunInfo
+    {
+        int frontFirst = -1;
+        int frontCount = 0;
+        int backFirst = -1;
+        int backCount = 0;
+    };
+    struct MoveWallGroupRunInfo
+    {
+        int activeFirst = -1;
+        int activeCount = 0;
+        int guideFirst = -1;
+        int guideCount = 0;
+    };
     bool PrepareRotateWallRunForEvent(int& targetZoneIndex, RotateWallRunInfo* outInfo = nullptr);
+    bool PrepareMoveWallGroupRunForEvent(int& targetZoneIndex, MoveWallGroupRunInfo* outInfo = nullptr);
+    bool PrepareMoveWallGroupRunForEvent(int& sourceZoneIndex, int guideZoneIndex, MoveWallGroupRunInfo* outInfo = nullptr);
+    bool RotateCommandIntersectsRun(const mapfmt::EventCommand& command, const RotateWallRunInfo& run);
+    void AddRotateCommand(std::vector<mapfmt::EventCommand>& commands, int first, int count, int speed, int flags);
     bool FinishSetTeleportTarget(POINT world);
     bool CommitPendingTeleportTarget();
     bool RotatePendingTeleportTargetByDegrees(int degrees);
@@ -949,6 +1162,10 @@ namespace
     void DrawEventMonsterSpawnOverlays(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds);
     void DrawEventSpawnConnectionLines(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, int eventIndex, const POINT& from);
     MonsterSpawnSelection HitTestMonsterSpawn(int sx, int sy, const RECT& rc);
+    void CancelMonsterSpawnDrag(bool refreshViews);
+    bool BeginMonsterSpawnDrag(const MonsterSpawnSelection& selection, POINT clientPoint, const RECT& rc);
+    bool UpdateMonsterSpawnDrag(POINT clientPoint, const RECT& rc);
+    bool FinishMonsterSpawnDrag();
     TeleportSelection HitTestTeleportTarget(int sx, int sy, const RECT& rc);
     RECT GetTextureSlotBarRect(const RECT& panelRc);
 
@@ -3101,12 +3318,27 @@ namespace
                     addCandidate(JoinPath(DirName(configuredRoot), rel));
                 }
             }
+            if (!g_app.gameProfile.rootPath.empty())
+            {
+                // Prefer the detected game root. This keeps Zombie Massacre on
+                // char/* sprites while classic Gloom profiles prefer objs/*.
+                addCandidate(JoinPath(g_app.gameProfile.rootPath, rel));
+            }
             addCandidate(JoinPath(mapDir, rel));
             addCandidate(JoinPath(projectDir, rel));
             addCandidate(rel);
         };
-        addPathSet(info.normalPath);
-        addPathSet(info.zombiePath);
+
+        if (g_app.gameProfile.kind == GameProfileKind::ZombieMassacre)
+        {
+            addPathSet(info.zombiePath);
+            addPathSet(info.normalPath);
+        }
+        else
+        {
+            addPathSet(info.normalPath);
+            addPathSet(info.zombiePath);
+        }
         for (const char* rel : ExtraObjectSpriteCandidates(info.type))
         {
             addPathSet(rel);
@@ -3160,7 +3392,10 @@ namespace
         outImage.name = info ? info->name : MonsterTypeName(objectType);
         outImage.category = info ? info->category : MonsterTypeCategory(objectType);
 
-        const std::string cachePrefix = TrimTrailingSlashes(g_app.textureDataPath) + "|" + DirName(g_app.document.sourcePath) + "|";
+        const std::string cachePrefix = TrimTrailingSlashes(g_app.textureDataPath) + "|" +
+            TrimTrailingSlashes(g_app.gameProfile.rootPath) + "|" +
+            std::to_string(static_cast<int>(g_app.gameProfile.kind)) + "|" +
+            DirName(g_app.document.sourcePath) + "|";
 
         if (!info)
         {
@@ -3306,6 +3541,10 @@ namespace
         g_app.selectedZone = -1;
         g_app.isDrawing = false;
         g_app.isPanning = false;
+        if (g_app.monsterSpawnDragging)
+        {
+            FinishMonsterSpawnDrag();
+        }
         g_app.drawWallAngleLock = false;
         g_app.drawWallLengthSnapLock = false;
         UpdateModeButtons();
@@ -4384,7 +4623,7 @@ namespace
         return ResolveAnimationForTextureIndex(GetActiveWallTextureIndex(), outAnimation);
     }
 
-    bool PrepareZoneAsOpenDoorMover(int targetZoneIndex)
+    bool PrepareZoneAsOpenDoorMover(int targetZoneIndex, bool allowActiveTextureConvenience = true)
     {
         if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
 
@@ -4407,7 +4646,7 @@ namespace
 
         mapfmt::AnimationEntry anim{};
         bool hasDoorLikeAnimatedTexture = ZoneUsesKnownAnimatedTexture(zone, anim);
-        if (!hasDoorLikeAnimatedTexture && ActiveWallTextureIsKnownAnimated(anim))
+        if (!hasDoorLikeAnimatedTexture && allowActiveTextureConvenience && ActiveWallTextureIsKnownAnimated(anim))
         {
             // Optional convenience only: if the user explicitly selected a
             // known animated band such as txt1_3 section 11..14 before linking,
@@ -4460,6 +4699,7 @@ namespace
 
     bool AddOpenDoorLinkToEvent(int eventIndex, int targetZoneIndex)
     {
+        if (EventScriptHasAdvancedRaw(eventIndex)) return false;
         if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
         if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
 
@@ -4489,6 +4729,175 @@ namespace
         {
             changed = AddSingleOpenDoorCommandIfMissing(commands, backfaceTarget) || changed;
         }
+        return changed;
+    }
+
+    bool MoveGroupPointsClose(POINT a, POINT b)
+    {
+        constexpr int tolerance = 4;
+        return std::abs(a.x - b.x) <= tolerance && std::abs(a.y - b.y) <= tolerance;
+    }
+
+    bool MoveGroupWallsShareEndpoint(const mapfmt::Zone& a, const mapfmt::Zone& b)
+    {
+        const POINT a1{ static_cast<LONG>(a.x1), static_cast<LONG>(a.z1) };
+        const POINT a2{ static_cast<LONG>(a.x2), static_cast<LONG>(a.z2) };
+        const POINT b1{ static_cast<LONG>(b.x1), static_cast<LONG>(b.z1) };
+        const POINT b2{ static_cast<LONG>(b.x2), static_cast<LONG>(b.z2) };
+        return MoveGroupPointsClose(a1, b1) || MoveGroupPointsClose(a1, b2) ||
+               MoveGroupPointsClose(a2, b1) || MoveGroupPointsClose(a2, b2);
+    }
+
+    bool MoveGroupWallsAreNearlyCollinear(const mapfmt::Zone& a, const mapfmt::Zone& b)
+    {
+        const double ax = static_cast<double>(a.x2) - static_cast<double>(a.x1);
+        const double az = static_cast<double>(a.z2) - static_cast<double>(a.z1);
+        const double bx = static_cast<double>(b.x2) - static_cast<double>(b.x1);
+        const double bz = static_cast<double>(b.z2) - static_cast<double>(b.z1);
+        const double alen = std::hypot(ax, az);
+        const double blen = std::hypot(bx, bz);
+        if (alen < 1.0 || blen < 1.0)
+        {
+            return false;
+        }
+
+        const double cross = std::abs(ax * bz - az * bx);
+        if (cross > (alen * blen * 0.035))
+        {
+            return false;
+        }
+
+        const double dot = (ax * bx + az * bz) / (alen * blen);
+        if (dot < 0.85)
+        {
+            return false;
+        }
+
+        // Parallel alone is not enough: two opposite sides of a closed wall
+        // block are parallel, but OpenDoor cannot translate that block as a
+        // rigid object. Require the candidate to lie on the same line as the
+        // selected moving face.
+        const double pointCross = std::abs(ax * (static_cast<double>(b.x1) - static_cast<double>(a.x1)) -
+                                           az * (static_cast<double>(b.z1) - static_cast<double>(a.z1)));
+        return pointCross <= (alen * 4.0);
+    }
+
+    void CollectCanonicalMoveWallLineGroup(int targetZoneIndex, std::vector<int>& outFronts)
+    {
+        outFronts.clear();
+        int target = GetCanonicalWallIndex(targetZoneIndex);
+        if (target < 0 || target >= static_cast<int>(g_app.document.zones.size()) || !IsCanonicalRotateWallIndex(target))
+        {
+            return;
+        }
+
+        const int zoneTotal = static_cast<int>(g_app.document.zones.size());
+        std::vector<uint8_t> used(static_cast<size_t>(zoneTotal), 0);
+        outFronts.push_back(target);
+        used[static_cast<size_t>(target)] = 1;
+
+        for (size_t cursor = 0; cursor < outFronts.size(); ++cursor)
+        {
+            const int current = outFronts[cursor];
+            const auto& currentZone = g_app.document.zones[current];
+            for (int i = 0; i < zoneTotal; ++i)
+            {
+                if (used[static_cast<size_t>(i)] || !IsCanonicalRotateWallIndex(i)) continue;
+                const auto& candidate = g_app.document.zones[i];
+                if (!MoveGroupWallsShareEndpoint(currentZone, candidate)) continue;
+                if (!MoveGroupWallsAreNearlyCollinear(g_app.document.zones[target], candidate)) continue;
+
+                used[static_cast<size_t>(i)] = 1;
+                outFronts.push_back(i);
+            }
+        }
+    }
+
+    std::vector<int> BuildOpenDoorRawTargetsForFronts(const std::vector<int>& fronts)
+    {
+        std::vector<int> targets;
+        targets.reserve(fronts.size() * 2);
+        for (int front : fronts)
+        {
+            AddUniqueIndex(targets, front);
+            const int backface = FindReverseWallPairIndex(front);
+            if (backface >= 0)
+            {
+                AddUniqueIndex(targets, backface);
+            }
+        }
+        return targets;
+    }
+
+    bool RemoveOpenDoorCommandsTargeting(std::vector<mapfmt::EventCommand>& commands, const std::vector<int>& rawTargets)
+    {
+        if (rawTargets.empty()) return false;
+        const auto oldSize = commands.size();
+        commands.erase(std::remove_if(commands.begin(), commands.end(), [&](const mapfmt::EventCommand& command)
+        {
+            if (command.type != mapfmt::CommandType::OpenDoor) return false;
+            return std::find(rawTargets.begin(), rawTargets.end(), static_cast<int>(command.params[0])) != rawTargets.end();
+        }), commands.end());
+        return commands.size() != oldSize;
+    }
+
+    bool AddMoveWallGroupLinkToEvent(int eventIndex, int sourceZoneIndex, int guideZoneIndex, int& targetZoneIndex)
+    {
+        if (EventScriptHasAdvancedRaw(eventIndex)) return false;
+        if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
+        if (sourceZoneIndex < 0 || sourceZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
+        if (guideZoneIndex < 0 || guideZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
+        if (!IsWallZone(g_app.document.zones[sourceZoneIndex]) || !IsWallZone(g_app.document.zones[guideZoneIndex])) return false;
+
+        int moveTargetZoneIndex = GetCanonicalWallIndex(sourceZoneIndex);
+        int guideTargetZoneIndex = GetCanonicalWallIndex(guideZoneIndex);
+        if (moveTargetZoneIndex < 0 || moveTargetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
+        if (guideTargetZoneIndex < 0 || guideTargetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
+        if (moveTargetZoneIndex == guideTargetZoneIndex) return false;
+
+        // Zombie Massacre map1b stores a sliding block as two consecutive polygon
+        // runs: the visible start block, directly followed by the same block at
+        // the target position with a/b cleared to 0.  The target run is therefore
+        // not guessed from the wall normal; it must come from a duplicate guide
+        // block the mapper placed at the desired destination.
+        MoveWallGroupRunInfo run;
+        if (!PrepareMoveWallGroupRunForEvent(moveTargetZoneIndex, guideTargetZoneIndex, &run)) return false;
+        targetZoneIndex = moveTargetZoneIndex;
+        if (run.activeFirst < 0 || run.activeCount <= 0 || run.guideFirst < 0 || run.guideCount != run.activeCount) return false;
+
+        auto& commands = g_app.document.events[eventIndex].commands;
+        bool changed = false;
+
+        std::vector<int> packedTargets;
+        packedTargets.reserve(static_cast<size_t>(run.activeCount + run.guideCount));
+        for (int i = 0; i < run.activeCount; ++i)
+        {
+            AddUniqueIndex(packedTargets, run.activeFirst + i);
+        }
+        for (int i = 0; i < run.guideCount; ++i)
+        {
+            AddUniqueIndex(packedTargets, run.guideFirst + i);
+        }
+
+        changed = RemoveOpenDoorCommandsTargeting(commands, packedTargets) || changed;
+
+        RotateWallRunInfo removeRun;
+        removeRun.frontFirst = run.activeFirst;
+        removeRun.frontCount = run.activeCount;
+        removeRun.backFirst = run.guideFirst;
+        removeRun.backCount = run.guideCount;
+        const auto oldSize = commands.size();
+        commands.erase(std::remove_if(commands.begin(), commands.end(), [&](const mapfmt::EventCommand& command)
+        {
+            return RotateCommandIntersectsRun(command, removeRun) ||
+                   (command.type == mapfmt::CommandType::RotatePoly && EventCommandTargetsZone(command, targetZoneIndex));
+        }), commands.end());
+        changed = changed || (commands.size() != oldSize);
+
+        constexpr int kMoveWallGroupDistance = 384;
+        constexpr int kMoveWallGroupFlags = 1;
+        AddRotateCommand(commands, run.activeFirst, run.activeCount, kMoveWallGroupDistance, kMoveWallGroupFlags);
+        changed = true;
         return changed;
     }
 
@@ -4590,6 +4999,7 @@ namespace
 
     bool AddSwitchTextureLinkToEvent(int eventIndex, int targetZoneIndex)
     {
+        if (EventScriptHasAdvancedRaw(eventIndex)) return false;
         if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
         if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
         if (!IsWallZone(g_app.document.zones[targetZoneIndex])) return false;
@@ -4680,9 +5090,16 @@ namespace
             return;
         }
 
+        const int eventIndex = EventSlotFromZoneEventValue(zone.ev);
+        if (eventIndex >= 0 && WarnIfEventScriptAdvancedRaw(eventIndex))
+        {
+            return;
+        }
+
         g_app.insertMode = InsertMode::LinkEventToZone;
         g_app.linkEventTriggerZone = g_app.selectedZone;
-        g_app.linkEventIndex = EventSlotFromZoneEventValue(zone.ev);
+        g_app.linkEventIndex = eventIndex;
+        ResetPendingMoveWallGroup();
         ResetPendingTeleportTarget();
         g_app.isDrawing = false;
         g_app.isPanning = false;
@@ -4759,9 +5176,16 @@ namespace
     {
         if (!CanUseSelectedEventTriggerAsSource(message)) return;
         const auto& zone = g_app.document.zones[g_app.selectedZone];
+        const int eventIndex = EventSlotFromZoneEventValue(zone.ev);
+        if (eventIndex >= 0 && WarnIfEventScriptAdvancedRaw(eventIndex))
+        {
+            return;
+        }
+
         g_app.insertMode = mode;
         g_app.linkEventTriggerZone = g_app.selectedZone;
-        g_app.linkEventIndex = EventSlotFromZoneEventValue(zone.ev);
+        g_app.linkEventIndex = eventIndex;
+        ResetPendingMoveWallGroup();
         ResetPendingTeleportTarget();
         g_app.isDrawing = false;
         g_app.isPanning = false;
@@ -4810,11 +5234,452 @@ namespace
             L"Select an Event Trigger line first, then choose Link Event > Rotate CW/CCW.");
     }
 
+    void StartLinkEventToMoveWallGroupTool()
+    {
+        BeginEventTriggerTargetTool(InsertMode::LinkEventToMoveWallGroup,
+            L"Select an Event Trigger line first, then choose Link Event > Move Wallblock.");
+        if (g_app.insertMode == InsertMode::LinkEventToMoveWallGroup)
+        {
+            ResetPendingMoveWallGroup();
+            RefreshStatus();
+            UpdateModeButtons();
+            InvalidateEditorViews();
+        }
+    }
+
     void StartSetTeleportTargetTool()
     {
         ResetPendingTeleportTarget();
         BeginEventTriggerTargetTool(InsertMode::SetTeleportTarget,
             L"Select an Event Trigger line first, then choose Set Teleport Target.");
+    }
+
+    void ResetPendingMoveWallGroup()
+    {
+        g_app.pendingMoveWallGroupSourceZone = -1;
+        g_app.pendingMoveWallGroupTargetPlacementActive = false;
+        g_app.pendingMoveWallGroupGuideFirst = -1;
+        g_app.pendingMoveWallGroupGuideCount = 0;
+        g_app.pendingMoveWallGroupSourcePickWorld = POINT{};
+        g_app.pendingMoveWallGroupTargetPickWorld = POINT{};
+        g_app.pendingMoveWallGroupTargetOffset = POINT{};
+    }
+
+    bool CollectPendingMoveWallGroupFronts(std::vector<int>& fronts)
+    {
+        fronts.clear();
+        if (g_app.pendingMoveWallGroupSourceZone < 0 ||
+            g_app.pendingMoveWallGroupSourceZone >= static_cast<int>(g_app.document.zones.size()))
+        {
+            return false;
+        }
+
+        CollectCanonicalRotateWallComponent(g_app.pendingMoveWallGroupSourceZone, fronts);
+        std::sort(fronts.begin(), fronts.end());
+        fronts.erase(std::unique(fronts.begin(), fronts.end()), fronts.end());
+        return !fronts.empty();
+    }
+
+    POINT CalculateWallRunCenterWorld(const std::vector<int>& fronts, POINT offset = POINT{})
+    {
+        if (fronts.empty())
+        {
+            return POINT{};
+        }
+
+        long long sumX = 0;
+        long long sumZ = 0;
+        int count = 0;
+        for (int index : fronts)
+        {
+            if (index < 0 || index >= static_cast<int>(g_app.document.zones.size())) continue;
+            const auto& zone = g_app.document.zones[index];
+            if (!IsWallZone(zone)) continue;
+            sumX += static_cast<int>(zone.x1) + static_cast<int>(zone.x2) + static_cast<int>(offset.x) * 2;
+            sumZ += static_cast<int>(zone.z1) + static_cast<int>(zone.z2) + static_cast<int>(offset.y) * 2;
+            count += 2;
+        }
+
+        if (count <= 0)
+        {
+            return POINT{};
+        }
+        return POINT{ static_cast<LONG>(std::lround(static_cast<double>(sumX) / static_cast<double>(count))),
+                      static_cast<LONG>(std::lround(static_cast<double>(sumZ) / static_cast<double>(count))) };
+    }
+
+    POINT CalculateZoneRangeCenterWorld(int first, int count)
+    {
+        std::vector<int> fronts;
+        fronts.reserve(static_cast<size_t>(MaxValue(0, count)));
+        for (int i = 0; i < count; ++i)
+        {
+            const int index = first + i;
+            if (index >= 0 && index < static_cast<int>(g_app.document.zones.size()) && IsWallZone(g_app.document.zones[index]))
+            {
+                fronts.push_back(index);
+            }
+        }
+        return CalculateWallRunCenterWorld(fronts);
+    }
+
+    bool BeginMoveWallGroupTargetPlacement(int targetZoneIndex, POINT pickWorld)
+    {
+        if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size()) ||
+            !IsWallZone(g_app.document.zones[targetZoneIndex]))
+        {
+            MessageBoxW(g_app.mainWindow, L"Click one segment of the wall block that should move.", L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+
+        const int canonicalTarget = GetCanonicalWallIndex(targetZoneIndex);
+        if (canonicalTarget >= 0 && canonicalTarget < static_cast<int>(g_app.document.zones.size()) &&
+            g_app.document.zones[canonicalTarget].a == 0 && g_app.document.zones[canonicalTarget].b == 0)
+        {
+            MessageBoxW(g_app.mainWindow, L"This is a hidden move target guide. Click the visible source wall block instead.", L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return false;
+        }
+
+        std::vector<int> sourceFronts;
+        CollectCanonicalRotateWallComponent(canonicalTarget, sourceFronts);
+        if (sourceFronts.empty())
+        {
+            MessageBoxW(g_app.mainWindow, L"Could not detect a connected source wall block.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return false;
+        }
+
+        g_app.pendingMoveWallGroupSourceZone = canonicalTarget;
+        g_app.pendingMoveWallGroupTargetPlacementActive = true;
+        g_app.pendingMoveWallGroupSourcePickWorld = SnapWorldPointToFineGrid(pickWorld);
+        g_app.pendingMoveWallGroupTargetPickWorld = g_app.pendingMoveWallGroupSourcePickWorld;
+        g_app.pendingMoveWallGroupTargetOffset = POINT{};
+        g_app.selectedZone = canonicalTarget;
+        ClearSelectedMonsterSpawn();
+        ClearSelectedTeleportTarget();
+        RefreshPreviewImage();
+        UpdateModeButtons();
+        RefreshStatus();
+        InvalidateEditorViews();
+        return true;
+    }
+
+    bool UpdateMoveWallGroupTargetPlacement(POINT world)
+    {
+        if (!g_app.pendingMoveWallGroupTargetPlacementActive)
+        {
+            return false;
+        }
+
+        const POINT target = SnapWorldPointToFineGrid(world);
+        const POINT offset{
+            static_cast<LONG>(target.x - g_app.pendingMoveWallGroupSourcePickWorld.x),
+            static_cast<LONG>(target.y - g_app.pendingMoveWallGroupSourcePickWorld.y)
+        };
+
+        if (target.x == g_app.pendingMoveWallGroupTargetPickWorld.x &&
+            target.y == g_app.pendingMoveWallGroupTargetPickWorld.y &&
+            offset.x == g_app.pendingMoveWallGroupTargetOffset.x &&
+            offset.y == g_app.pendingMoveWallGroupTargetOffset.y)
+        {
+            return true;
+        }
+
+        g_app.pendingMoveWallGroupTargetPickWorld = target;
+        g_app.pendingMoveWallGroupTargetOffset = offset;
+        RefreshStatus();
+        InvalidateEditorViews();
+        return true;
+    }
+
+    int AppendMoveWallGroupGuideZonesFromOffset(const std::vector<int>& sourceFronts, POINT offset)
+    {
+        if (sourceFronts.empty())
+        {
+            return -1;
+        }
+
+        const int guideFirst = static_cast<int>(g_app.document.zones.size());
+        for (int front : sourceFronts)
+        {
+            if (front < 0 || front >= static_cast<int>(g_app.document.zones.size()) || !IsWallZone(g_app.document.zones[front]))
+            {
+                return -1;
+            }
+
+            mapfmt::Zone guide = g_app.document.zones[front];
+            guide.x1 = ClampWorldToInt16(static_cast<int>(guide.x1) + static_cast<int>(offset.x));
+            guide.z1 = ClampWorldToInt16(static_cast<int>(guide.z1) + static_cast<int>(offset.y));
+            guide.x2 = ClampWorldToInt16(static_cast<int>(guide.x2) + static_cast<int>(offset.x));
+            guide.z2 = ClampWorldToInt16(static_cast<int>(guide.z2) + static_cast<int>(offset.y));
+            mapfmt::RecalculateWallMetadata(guide);
+            UpdateWallTextureBandCountFromLength(guide);
+            MakeMoveWallGroupGuideAiNeutral(guide);
+            g_app.document.zones.push_back(guide);
+        }
+
+        g_app.pendingMoveWallGroupGuideFirst = guideFirst;
+        g_app.pendingMoveWallGroupGuideCount = static_cast<int>(sourceFronts.size());
+        return guideFirst;
+    }
+
+    bool CommitMoveWallGroupTargetPlacement(POINT world)
+    {
+        if (g_app.insertMode != InsertMode::LinkEventToMoveWallGroup || !g_app.pendingMoveWallGroupTargetPlacementActive)
+        {
+            return false;
+        }
+        if (g_app.linkEventTriggerZone < 0 || g_app.linkEventTriggerZone >= static_cast<int>(g_app.document.zones.size()))
+        {
+            ClearInsertMode();
+            return true;
+        }
+
+        UpdateMoveWallGroupTargetPlacement(world);
+        const POINT offset = g_app.pendingMoveWallGroupTargetOffset;
+        if (offset.x == 0 && offset.y == 0)
+        {
+            MessageBoxW(g_app.mainWindow, L"Move the copied wall block to a different grid position before placing it.", L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        std::vector<int> sourceFronts;
+        if (!CollectPendingMoveWallGroupFronts(sourceFronts))
+        {
+            MessageBoxW(g_app.mainWindow, L"Could not detect the selected source wall block anymore.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            ResetPendingMoveWallGroup();
+            UpdateModeButtons();
+            RefreshStatus();
+            InvalidateEditorViews();
+            return true;
+        }
+
+        PushUndoSnapshot();
+        const int eventIndex = EnsureTriggerHasEventSlot(g_app.linkEventTriggerZone);
+        if (eventIndex < 0)
+        {
+            UndoLastChange();
+            MessageBoxW(g_app.mainWindow, L"Could not assign an event slot to this trigger.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        const int guideFirst = AppendMoveWallGroupGuideZonesFromOffset(sourceFronts, offset);
+        if (guideFirst < 0)
+        {
+            UndoLastChange();
+            g_app.pendingMoveWallGroupGuideFirst = -1;
+            g_app.pendingMoveWallGroupGuideCount = 0;
+            MessageBoxW(g_app.mainWindow, L"Could not create the hidden target guide block.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        int moveTargetZoneIndex = g_app.pendingMoveWallGroupSourceZone;
+        if (!AddMoveWallGroupLinkToEvent(eventIndex, g_app.pendingMoveWallGroupSourceZone, guideFirst, moveTargetZoneIndex))
+        {
+            UndoLastChange();
+            g_app.pendingMoveWallGroupGuideFirst = -1;
+            g_app.pendingMoveWallGroupGuideCount = 0;
+            MessageBoxW(g_app.mainWindow,
+                L"Could not build a map1b-style move wallblock from the selected block and target position.",
+                L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        g_app.linkEventIndex = eventIndex;
+        g_app.selectedZone = GetCanonicalWallIndex(moveTargetZoneIndex);
+        g_app.insertMode = InsertMode::None;
+        g_app.linkEventTriggerZone = -1;
+        ResetPendingMoveWallGroup();
+        if (GetCapture() == g_app.canvas) ReleaseCapture();
+        MarkDirty();
+        RefreshZoneList();
+        RefreshPreviewImage();
+        UpdateModeButtons();
+        RefreshStatus();
+        UpdateCanvasScrollBars(g_app.canvas);
+        InvalidateEditorViews();
+        return true;
+    }
+
+    bool IsMoveWallGroupRotateCommand(const mapfmt::EventCommand& command)
+    {
+        if (command.type != mapfmt::CommandType::RotatePoly)
+        {
+            return false;
+        }
+
+        const int distance = std::abs(static_cast<int>(command.params[2]));
+        const int flags = static_cast<int>(command.params[3]);
+        return distance == 384 && (flags == 1 || flags == 3);
+    }
+
+    std::vector<uint8_t> BuildMoveWallGroupGuideMaskForDocument(const mapfmt::MapDocument& document)
+    {
+        std::vector<uint8_t> guideMask(document.zones.size(), 0);
+        for (const auto& script : document.events)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+
+            for (const auto& command : script.commands)
+            {
+                if (!IsMoveWallGroupRotateCommand(command))
+                {
+                    continue;
+                }
+
+                const int first = static_cast<int>(command.params[0]);
+                const int count = MaxValue(1, static_cast<int>(command.params[1]));
+                const int guideFirst = first + count;
+                if (first < 0 || guideFirst < 0 || guideFirst + count > static_cast<int>(document.zones.size()))
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < count; ++i)
+                {
+                    guideMask[static_cast<size_t>(guideFirst + i)] = 1;
+                }
+            }
+        }
+        return guideMask;
+    }
+
+    bool IsMoveWallGroupGuideZoneIndex(const std::vector<uint8_t>& guideMask, int zoneIndex)
+    {
+        return zoneIndex >= 0 &&
+               zoneIndex < static_cast<int>(guideMask.size()) &&
+               guideMask[static_cast<size_t>(zoneIndex)] != 0;
+    }
+
+    void DrawDottedArrowLine(HDC hdc, const POINT& from, const POINT& to, COLORREF color)
+    {
+        HPEN dottedPen = CreatePen(PS_DOT, 1, color);
+        HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, dottedPen));
+        MoveToEx(hdc, from.x, from.y, nullptr);
+        LineTo(hdc, to.x, to.y);
+        SelectObject(hdc, oldPen);
+        DeleteObject(dottedPen);
+
+        const double dx = static_cast<double>(to.x - from.x);
+        const double dy = static_cast<double>(to.y - from.y);
+        const double len = std::sqrt(dx * dx + dy * dy);
+        if (len < 3.0)
+        {
+            return;
+        }
+
+        const double ux = dx / len;
+        const double uy = dy / len;
+        const double px = -uy;
+        const double py = ux;
+        const int arrowLen = 12;
+        const int arrowHalf = 5;
+        POINT arrow[3] =
+        {
+            to,
+            POINT{ static_cast<LONG>(std::lround(static_cast<double>(to.x) - ux * arrowLen + px * arrowHalf)),
+                   static_cast<LONG>(std::lround(static_cast<double>(to.y) - uy * arrowLen + py * arrowHalf)) },
+            POINT{ static_cast<LONG>(std::lround(static_cast<double>(to.x) - ux * arrowLen - px * arrowHalf)),
+                   static_cast<LONG>(std::lround(static_cast<double>(to.y) - uy * arrowLen - py * arrowHalf)) }
+        };
+
+        HPEN arrowPen = CreatePen(PS_SOLID, 1, color);
+        HBRUSH arrowBrush = CreateSolidBrush(color);
+        HPEN oldArrowPen = static_cast<HPEN>(SelectObject(hdc, arrowPen));
+        HBRUSH oldArrowBrush = static_cast<HBRUSH>(SelectObject(hdc, arrowBrush));
+        Polygon(hdc, arrow, 3);
+        SelectObject(hdc, oldArrowBrush);
+        SelectObject(hdc, oldArrowPen);
+        DeleteObject(arrowBrush);
+        DeleteObject(arrowPen);
+    }
+
+    void DrawMoveWallGroupPlacementPreview(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds)
+    {
+        if (!g_app.pendingMoveWallGroupTargetPlacementActive)
+        {
+            return;
+        }
+
+        std::vector<int> fronts;
+        if (!CollectPendingMoveWallGroupFronts(fronts))
+        {
+            return;
+        }
+
+        const POINT offset = g_app.pendingMoveWallGroupTargetOffset;
+        const POINT sourceCenter = CalculateWallRunCenterWorld(fronts);
+        const POINT targetCenter = CalculateWallRunCenterWorld(fronts, offset);
+        DrawDottedArrowLine(hdc, WorldToScreen(rc, bounds, sourceCenter.x, sourceCenter.y),
+            WorldToScreen(rc, bounds, targetCenter.x, targetCenter.y), RGB(145, 155, 170));
+
+        HPEN sourcePen = CreatePen(PS_SOLID, 4, RGB(255, 220, 64));
+        HPEN ghostPen = CreatePen(PS_DASH, 3, RGB(120, 132, 150));
+        HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, sourcePen));
+        for (int front : fronts)
+        {
+            if (front < 0 || front >= static_cast<int>(g_app.document.zones.size())) continue;
+            const auto& zone = g_app.document.zones[front];
+            POINT p1 = WorldToScreen(rc, bounds, zone.x1, zone.z1);
+            POINT p2 = WorldToScreen(rc, bounds, zone.x2, zone.z2);
+            MoveToEx(hdc, p1.x, p1.y, nullptr);
+            LineTo(hdc, p2.x, p2.y);
+        }
+
+        SelectObject(hdc, ghostPen);
+        for (int front : fronts)
+        {
+            if (front < 0 || front >= static_cast<int>(g_app.document.zones.size())) continue;
+            const auto& zone = g_app.document.zones[front];
+            POINT p1 = WorldToScreen(rc, bounds, static_cast<int>(zone.x1) + static_cast<int>(offset.x), static_cast<int>(zone.z1) + static_cast<int>(offset.y));
+            POINT p2 = WorldToScreen(rc, bounds, static_cast<int>(zone.x2) + static_cast<int>(offset.x), static_cast<int>(zone.z2) + static_cast<int>(offset.y));
+            MoveToEx(hdc, p1.x, p1.y, nullptr);
+            LineTo(hdc, p2.x, p2.y);
+        }
+
+        SelectObject(hdc, oldPen);
+        DeleteObject(ghostPen);
+        DeleteObject(sourcePen);
+    }
+
+    void DrawMoveWallGroupEventPaths(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, int eventIndex)
+    {
+        if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size()))
+        {
+            return;
+        }
+
+        const auto& commands = g_app.document.events[eventIndex].commands;
+        for (const auto& command : commands)
+        {
+            if (!IsMoveWallGroupRotateCommand(command))
+            {
+                continue;
+            }
+
+            const int first = static_cast<int>(command.params[0]);
+            const int count = MaxValue(1, static_cast<int>(command.params[1]));
+            const int guideFirst = first + count;
+            if (first < 0 || guideFirst < 0 || guideFirst + count > static_cast<int>(g_app.document.zones.size()))
+            {
+                continue;
+            }
+
+            const POINT sourceCenter = CalculateZoneRangeCenterWorld(first, count);
+            const POINT targetCenter = CalculateZoneRangeCenterWorld(guideFirst, count);
+            DrawDottedArrowLine(hdc, WorldToScreen(rc, bounds, sourceCenter.x, sourceCenter.y),
+                WorldToScreen(rc, bounds, targetCenter.x, targetCenter.y), RGB(145, 155, 170));
+        }
+    }
+
+    void DrawAllMoveWallGroupEventPaths(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds)
+    {
+        for (int eventIndex = 0; eventIndex < static_cast<int>(g_app.document.events.size()); ++eventIndex)
+        {
+            DrawMoveWallGroupEventPaths(hdc, rc, bounds, eventIndex);
+        }
     }
 
     void ResetPendingTeleportTarget()
@@ -4864,14 +5729,6 @@ namespace
         RefreshStatus();
         InvalidateEditorViews();
     }
-
-    struct RotateWallRunInfo
-    {
-        int frontFirst = -1;
-        int frontCount = 0;
-        int backFirst = -1;
-        int backCount = 0;
-    };
 
     bool PointsAlmostSameForRotate(POINT a, POINT b, int tolerance = 4)
     {
@@ -5004,6 +5861,440 @@ namespace
         return ordered;
     }
 
+    double CalculateOrderedWallSignedArea(const std::vector<int>& ordered)
+    {
+        double signedArea = 0.0;
+        for (int index : ordered)
+        {
+            if (index < 0 || index >= static_cast<int>(g_app.document.zones.size())) continue;
+            const auto& zone = g_app.document.zones[index];
+            signedArea += (static_cast<double>(zone.x1) * static_cast<double>(zone.z2)) -
+                          (static_cast<double>(zone.x2) * static_cast<double>(zone.z1));
+        }
+        return signedArea;
+    }
+
+    std::vector<int> OrderAndOrientMoveGroupFronts(const std::vector<int>& fronts)
+    {
+        std::vector<int> ordered = OrderAndOrientRotateFronts(fronts);
+        const double signedArea = CalculateOrderedWallSignedArea(ordered);
+
+        // Zombie Massacre map1b stores moving wall blocks as one positive-area
+        // polygon run (Z47..Z50 and Z55..Z58).  The normal rotate-link helper
+        // intentionally flips that orientation for hinged rotations; the move
+        // variant must keep the map1b orientation or Gloom treats the block like
+        // a folding/rotating polygon.
+        if (ordered.size() > 2 && signedArea < 0.0)
+        {
+            std::reverse(ordered.begin(), ordered.end());
+            for (int index : ordered)
+            {
+                ReverseWallDirectionPreservingTexture(g_app.document.zones[index]);
+                mapfmt::RecalculateWallMetadata(g_app.document.zones[index]);
+                UpdateWallTextureBandCountFromLength(g_app.document.zones[index]);
+            }
+        }
+
+        return ordered;
+    }
+
+    void MakeMoveWallGroupGuideAiNeutral(mapfmt::Zone& guide)
+    {
+        // Editor-created move-wallblock target guides are addressed by the
+        // RotatePoly command through their endpoint coordinates only. Keep the
+        // line endpoints intact, but clear wall-like collision/AI metadata so
+        // ZGloom cannot treat the invisible guide as a real nearby obstacle.
+        guide.a = 0;
+        guide.b = 0;
+        guide.na = 0;
+        guide.nb = 0;
+        guide.ln = 0;
+        guide.sc = 0;
+        guide.textures.fill(0);
+        guide.ev = 0;
+    }
+
+    POINT CalculateMoveWallGroupGuideOffset(const mapfmt::Zone& selectedWall)
+    {
+        mapfmt::Zone basis = selectedWall;
+        mapfmt::RecalculateWallMetadata(basis);
+
+        constexpr int kMoveWallGroupGuideDistance = 384;
+        constexpr double kFixedPointOne = 32766.0;
+        int dx = static_cast<int>(std::lround((static_cast<double>(basis.a) / kFixedPointOne) * kMoveWallGroupGuideDistance));
+        int dz = static_cast<int>(std::lround((static_cast<double>(basis.b) / kFixedPointOne) * kMoveWallGroupGuideDistance));
+
+        if (std::abs(dx) < 1 && std::abs(dz) < 1)
+        {
+            dx = 0;
+            dz = kMoveWallGroupGuideDistance;
+        }
+
+        const auto snapToFineGrid = [](int value)
+        {
+            if (value == 0) return 0;
+            const int sign = value < 0 ? -1 : 1;
+            const int absValue = std::abs(value);
+            return sign * MaxValue(kGridSnapStep, static_cast<int>(std::lround(static_cast<double>(absValue) / static_cast<double>(kGridSnapStep))) * kGridSnapStep);
+        };
+        dx = snapToFineGrid(dx);
+        dz = snapToFineGrid(dz);
+        return POINT{ static_cast<LONG>(dx), static_cast<LONG>(dz) };
+    }
+
+    mapfmt::Zone MakeMoveWallGroupGuideZone(const mapfmt::Zone& active, POINT offset)
+    {
+        mapfmt::Zone guide = active;
+        guide.x1 = static_cast<int16_t>(ClampValue(static_cast<int>(guide.x1) + static_cast<int>(offset.x), -32768, 32767));
+        guide.z1 = static_cast<int16_t>(ClampValue(static_cast<int>(guide.z1) + static_cast<int>(offset.y), -32768, 32767));
+        guide.x2 = static_cast<int16_t>(ClampValue(static_cast<int>(guide.x2) + static_cast<int>(offset.x), -32768, 32767));
+        guide.z2 = static_cast<int16_t>(ClampValue(static_cast<int>(guide.z2) + static_cast<int>(offset.y), -32768, 32767));
+        mapfmt::RecalculateWallMetadata(guide);
+        UpdateWallTextureBandCountFromLength(guide);
+
+        MakeMoveWallGroupGuideAiNeutral(guide);
+        return guide;
+    }
+
+    bool PrepareMoveWallGroupRunForEvent(int& targetZoneIndex, MoveWallGroupRunInfo* outInfo)
+    {
+        if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size()) ||
+            !IsWallZone(g_app.document.zones[targetZoneIndex]))
+        {
+            return false;
+        }
+
+        const int originalTarget = GetCanonicalWallIndex(targetZoneIndex);
+        if (originalTarget < 0 || originalTarget >= static_cast<int>(g_app.document.zones.size()))
+        {
+            return false;
+        }
+
+        const POINT guideOffset = CalculateMoveWallGroupGuideOffset(g_app.document.zones[originalTarget]);
+
+        std::vector<int> fronts;
+        CollectCanonicalRotateWallComponent(originalTarget, fronts);
+        if (fronts.empty())
+        {
+            return false;
+        }
+
+        std::sort(fronts.begin(), fronts.end());
+        fronts.erase(std::unique(fronts.begin(), fronts.end()), fronts.end());
+
+        // Remember editor-created reverse faces before ordering/orienting the
+        // active polygon.  The ordering step may reverse individual wall lines,
+        // after which an exact reverse-pair lookup would no longer find the old
+        // visual backface.  Those slots are intentionally reused as map1b-style
+        // guide/destination zones.
+        std::vector<std::pair<int, int>> originalBackfacePairs;
+        originalBackfacePairs.reserve(fronts.size());
+        for (int front : fronts)
+        {
+            const int backface = FindReverseWallPairIndex(front);
+            if (backface >= 0 && backface < static_cast<int>(g_app.document.zones.size()))
+            {
+                originalBackfacePairs.emplace_back(front, backface);
+            }
+        }
+
+        fronts = OrderAndOrientMoveGroupFronts(fronts);
+        if (fronts.empty())
+        {
+            return false;
+        }
+
+        std::vector<int> backfaceSlots;
+        backfaceSlots.reserve(fronts.size());
+        for (int front : fronts)
+        {
+            if (front >= 0 && front < static_cast<int>(g_app.document.zones.size()))
+            {
+                mapfmt::RecalculateWallMetadata(g_app.document.zones[front]);
+                UpdateWallTextureBandCountFromLength(g_app.document.zones[front]);
+            }
+
+            int backface = -1;
+            for (const auto& pair : originalBackfacePairs)
+            {
+                if (pair.first == front)
+                {
+                    backface = pair.second;
+                    break;
+                }
+            }
+            if (backface < 0)
+            {
+                backface = FindReverseWallPairIndex(front);
+            }
+            if (backface < 0 || backface >= static_cast<int>(g_app.document.zones.size()))
+            {
+                backface = -1;
+            }
+            backfaceSlots.push_back(backface);
+        }
+
+        std::vector<int> members;
+        members.reserve(fronts.size() + backfaceSlots.size());
+        for (int front : fronts) AddUniqueIndex(members, front);
+        for (int slot : backfaceSlots) AddUniqueIndex(members, slot);
+
+        const int oldCount = static_cast<int>(g_app.document.zones.size());
+        std::vector<uint8_t> isMember(static_cast<size_t>(oldCount), 0);
+        for (int index : members)
+        {
+            if (index >= 0 && index < oldCount)
+            {
+                isMember[static_cast<size_t>(index)] = 1;
+            }
+        }
+
+        std::vector<mapfmt::Zone> reordered;
+        reordered.reserve(g_app.document.zones.size() + fronts.size());
+        std::vector<int> oldToNew(static_cast<size_t>(oldCount), -1);
+        for (int i = 0; i < oldCount; ++i)
+        {
+            if (isMember[static_cast<size_t>(i)]) continue;
+            oldToNew[static_cast<size_t>(i)] = static_cast<int>(reordered.size());
+            reordered.push_back(g_app.document.zones[i]);
+        }
+
+        const int activeFirst = static_cast<int>(reordered.size());
+        for (int oldIndex : fronts)
+        {
+            oldToNew[static_cast<size_t>(oldIndex)] = static_cast<int>(reordered.size());
+            reordered.push_back(g_app.document.zones[oldIndex]);
+        }
+
+        const int guideFirst = static_cast<int>(reordered.size());
+        for (size_t i = 0; i < fronts.size(); ++i)
+        {
+            const int frontOldIndex = fronts[i];
+            const int guideNewIndex = static_cast<int>(reordered.size());
+            if (i < backfaceSlots.size() && backfaceSlots[i] >= 0 && backfaceSlots[i] < oldCount)
+            {
+                oldToNew[static_cast<size_t>(backfaceSlots[i])] = guideNewIndex;
+            }
+            reordered.push_back(MakeMoveWallGroupGuideZone(g_app.document.zones[frontOldIndex], guideOffset));
+        }
+
+        g_app.document.zones = std::move(reordered);
+        RemapEventZoneReferencesAfterReorder(oldToNew);
+        if (g_app.selectedZone >= 0)
+        {
+            g_app.selectedZone = RemapZoneIndex(oldToNew, g_app.selectedZone);
+        }
+        if (g_app.linkEventTriggerZone >= 0)
+        {
+            g_app.linkEventTriggerZone = RemapZoneIndex(oldToNew, g_app.linkEventTriggerZone);
+        }
+        targetZoneIndex = RemapZoneIndex(oldToNew, originalTarget);
+
+        if (outInfo)
+        {
+            outInfo->activeFirst = activeFirst;
+            outInfo->activeCount = static_cast<int>(fronts.size());
+            outInfo->guideFirst = guideFirst;
+            outInfo->guideCount = static_cast<int>(fronts.size());
+        }
+
+        return targetZoneIndex >= activeFirst && targetZoneIndex < activeFirst + static_cast<int>(fronts.size());
+    }
+
+    int FindOriginalBackfaceForFront(const std::vector<std::pair<int, int>>& originalBackfacePairs, int frontIndex)
+    {
+        for (const auto& pair : originalBackfacePairs)
+        {
+            if (pair.first == frontIndex)
+            {
+                return pair.second;
+            }
+        }
+        return -1;
+    }
+
+    mapfmt::Zone MakeMoveWallGroupGuideZoneFromTarget(const mapfmt::Zone& target)
+    {
+        mapfmt::Zone guide = target;
+        mapfmt::RecalculateWallMetadata(guide);
+        UpdateWallTextureBandCountFromLength(guide);
+        MakeMoveWallGroupGuideAiNeutral(guide);
+        return guide;
+    }
+
+    bool WallRunsShareAnyZone(const std::vector<int>& a, const std::vector<int>& b)
+    {
+        for (int ai : a)
+        {
+            if (std::find(b.begin(), b.end(), ai) != b.end())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool PrepareMoveWallGroupRunForEvent(int& sourceZoneIndex, int guideZoneIndex, MoveWallGroupRunInfo* outInfo)
+    {
+        if (sourceZoneIndex < 0 || sourceZoneIndex >= static_cast<int>(g_app.document.zones.size()) ||
+            guideZoneIndex < 0 || guideZoneIndex >= static_cast<int>(g_app.document.zones.size()) ||
+            !IsWallZone(g_app.document.zones[sourceZoneIndex]) || !IsWallZone(g_app.document.zones[guideZoneIndex]))
+        {
+            return false;
+        }
+
+        const int originalSource = GetCanonicalWallIndex(sourceZoneIndex);
+        const int originalGuide = GetCanonicalWallIndex(guideZoneIndex);
+        if (originalSource < 0 || originalGuide < 0 ||
+            originalSource >= static_cast<int>(g_app.document.zones.size()) ||
+            originalGuide >= static_cast<int>(g_app.document.zones.size()) ||
+            originalSource == originalGuide)
+        {
+            return false;
+        }
+
+        std::vector<int> sourceFronts;
+        std::vector<int> guideFronts;
+        CollectCanonicalRotateWallComponent(originalSource, sourceFronts);
+        CollectCanonicalRotateWallComponent(originalGuide, guideFronts);
+        if (sourceFronts.empty() || guideFronts.empty())
+        {
+            return false;
+        }
+
+        std::sort(sourceFronts.begin(), sourceFronts.end());
+        sourceFronts.erase(std::unique(sourceFronts.begin(), sourceFronts.end()), sourceFronts.end());
+        std::sort(guideFronts.begin(), guideFronts.end());
+        guideFronts.erase(std::unique(guideFronts.begin(), guideFronts.end()), guideFronts.end());
+        if (sourceFronts.size() != guideFronts.size() || WallRunsShareAnyZone(sourceFronts, guideFronts))
+        {
+            return false;
+        }
+
+        std::vector<std::pair<int, int>> sourceBackfacePairs;
+        sourceBackfacePairs.reserve(sourceFronts.size());
+        for (int front : sourceFronts)
+        {
+            const int backface = FindReverseWallPairIndex(front);
+            if (backface >= 0 && backface < static_cast<int>(g_app.document.zones.size()))
+            {
+                sourceBackfacePairs.emplace_back(front, backface);
+            }
+        }
+
+        std::vector<std::pair<int, int>> guideBackfacePairs;
+        guideBackfacePairs.reserve(guideFronts.size());
+        for (int front : guideFronts)
+        {
+            const int backface = FindReverseWallPairIndex(front);
+            if (backface >= 0 && backface < static_cast<int>(g_app.document.zones.size()))
+            {
+                guideBackfacePairs.emplace_back(front, backface);
+            }
+        }
+
+        sourceFronts = OrderAndOrientMoveGroupFronts(sourceFronts);
+        guideFronts = OrderAndOrientMoveGroupFronts(guideFronts);
+        if (sourceFronts.empty() || guideFronts.empty() || sourceFronts.size() != guideFronts.size())
+        {
+            return false;
+        }
+
+        std::vector<int> sourceBackfaces;
+        sourceBackfaces.reserve(sourceFronts.size());
+        for (int front : sourceFronts)
+        {
+            sourceBackfaces.push_back(FindOriginalBackfaceForFront(sourceBackfacePairs, front));
+        }
+        std::vector<int> guideBackfaces;
+        guideBackfaces.reserve(guideFronts.size());
+        for (int front : guideFronts)
+        {
+            guideBackfaces.push_back(FindOriginalBackfaceForFront(guideBackfacePairs, front));
+        }
+
+        std::vector<int> members;
+        members.reserve(sourceFronts.size() + guideFronts.size() + sourceBackfaces.size() + guideBackfaces.size());
+        for (int front : sourceFronts) AddUniqueIndex(members, front);
+        for (int front : guideFronts) AddUniqueIndex(members, front);
+        for (int backface : sourceBackfaces) AddUniqueIndex(members, backface);
+        for (int backface : guideBackfaces) AddUniqueIndex(members, backface);
+
+        const int oldCount = static_cast<int>(g_app.document.zones.size());
+        std::vector<uint8_t> isMember(static_cast<size_t>(oldCount), 0);
+        for (int index : members)
+        {
+            if (index >= 0 && index < oldCount)
+            {
+                isMember[static_cast<size_t>(index)] = 1;
+            }
+        }
+
+        std::vector<mapfmt::Zone> reordered;
+        reordered.reserve(g_app.document.zones.size());
+        std::vector<int> oldToNew(static_cast<size_t>(oldCount), -1);
+        for (int i = 0; i < oldCount; ++i)
+        {
+            if (isMember[static_cast<size_t>(i)]) continue;
+            oldToNew[static_cast<size_t>(i)] = static_cast<int>(reordered.size());
+            reordered.push_back(g_app.document.zones[i]);
+        }
+
+        const int activeFirst = static_cast<int>(reordered.size());
+        for (size_t i = 0; i < sourceFronts.size(); ++i)
+        {
+            const int oldIndex = sourceFronts[i];
+            const int newIndex = static_cast<int>(reordered.size());
+            oldToNew[static_cast<size_t>(oldIndex)] = newIndex;
+            if (i < sourceBackfaces.size() && sourceBackfaces[i] >= 0 && sourceBackfaces[i] < oldCount)
+            {
+                oldToNew[static_cast<size_t>(sourceBackfaces[i])] = newIndex;
+            }
+            mapfmt::RecalculateWallMetadata(g_app.document.zones[oldIndex]);
+            UpdateWallTextureBandCountFromLength(g_app.document.zones[oldIndex]);
+            reordered.push_back(g_app.document.zones[oldIndex]);
+        }
+
+        const int guideFirst = static_cast<int>(reordered.size());
+        for (size_t i = 0; i < guideFronts.size(); ++i)
+        {
+            const int oldIndex = guideFronts[i];
+            const int newIndex = static_cast<int>(reordered.size());
+            oldToNew[static_cast<size_t>(oldIndex)] = newIndex;
+            if (i < guideBackfaces.size() && guideBackfaces[i] >= 0 && guideBackfaces[i] < oldCount)
+            {
+                oldToNew[static_cast<size_t>(guideBackfaces[i])] = newIndex;
+            }
+            reordered.push_back(MakeMoveWallGroupGuideZoneFromTarget(g_app.document.zones[oldIndex]));
+        }
+
+        g_app.document.zones = std::move(reordered);
+        RemapEventZoneReferencesAfterReorder(oldToNew);
+        if (g_app.selectedZone >= 0)
+        {
+            g_app.selectedZone = RemapZoneIndex(oldToNew, g_app.selectedZone);
+        }
+        if (g_app.linkEventTriggerZone >= 0)
+        {
+            g_app.linkEventTriggerZone = RemapZoneIndex(oldToNew, g_app.linkEventTriggerZone);
+        }
+        if (g_app.pendingMoveWallGroupSourceZone >= 0)
+        {
+            g_app.pendingMoveWallGroupSourceZone = RemapZoneIndex(oldToNew, g_app.pendingMoveWallGroupSourceZone);
+        }
+        sourceZoneIndex = RemapZoneIndex(oldToNew, originalSource);
+
+        if (outInfo)
+        {
+            outInfo->activeFirst = activeFirst;
+            outInfo->activeCount = static_cast<int>(sourceFronts.size());
+            outInfo->guideFirst = guideFirst;
+            outInfo->guideCount = static_cast<int>(guideFronts.size());
+        }
+
+        return sourceZoneIndex >= activeFirst && sourceZoneIndex < activeFirst + static_cast<int>(sourceFronts.size());
+    }
+
     void CollectCanonicalRotateWallComponent(int targetZoneIndex, std::vector<int>& outFronts)
     {
         outFronts.clear();
@@ -5019,6 +6310,10 @@ namespace
         }
 
         const int zoneTotal = static_cast<int>(g_app.document.zones.size());
+        const int pendingGuideFirst = g_app.pendingMoveWallGroupGuideFirst;
+        const int pendingGuideLast = pendingGuideFirst + g_app.pendingMoveWallGroupGuideCount - 1;
+        const bool hasPendingGuideRun = pendingGuideFirst >= 0 && g_app.pendingMoveWallGroupGuideCount > 0;
+        const bool targetIsPendingGuide = hasPendingGuideRun && target >= pendingGuideFirst && target <= pendingGuideLast;
         std::vector<uint8_t> used(static_cast<size_t>(zoneTotal), 0);
         outFronts.push_back(target);
         used[static_cast<size_t>(target)] = 1;
@@ -5031,6 +6326,11 @@ namespace
             {
                 if (i < 0 || i >= static_cast<int>(used.size())) continue;
                 if (used[static_cast<size_t>(i)] || !IsCanonicalRotateWallIndex(i)) continue;
+                if (hasPendingGuideRun)
+                {
+                    const bool candidateIsPendingGuide = i >= pendingGuideFirst && i <= pendingGuideLast;
+                    if (targetIsPendingGuide != candidateIsPendingGuide) continue;
+                }
                 if (PointsTouchForRotateRun(curZone, g_app.document.zones[i]))
                 {
                     used[static_cast<size_t>(i)] = 1;
@@ -5284,6 +6584,7 @@ namespace
 
     bool AddRotatePolyLinkToEvent(int eventIndex, int& targetZoneIndex, bool clockwise)
     {
+        if (EventScriptHasAdvancedRaw(eventIndex)) return false;
         if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
         int rotateTargetZoneIndex = targetZoneIndex;
         RotateWallRunInfo run;
@@ -5511,8 +6812,100 @@ namespace
         return true;
     }
 
+    bool FinishLinkEventToMoveWallGroup(int targetZoneIndex)
+    {
+        if (g_app.insertMode != InsertMode::LinkEventToMoveWallGroup) return false;
+        if (g_app.linkEventTriggerZone < 0 || g_app.linkEventTriggerZone >= static_cast<int>(g_app.document.zones.size()))
+        {
+            ClearInsertMode();
+            return true;
+        }
+        if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return true;
+        if (!IsWallZone(g_app.document.zones[targetZoneIndex]))
+        {
+            MessageBoxW(g_app.mainWindow,
+                g_app.pendingMoveWallGroupSourceZone < 0
+                    ? L"First click one segment of the wall block that should move."
+                    : L"Now click one segment of the duplicate wall block at the target position.",
+                L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        const int canonicalTarget = GetCanonicalWallIndex(targetZoneIndex);
+        if (g_app.pendingMoveWallGroupSourceZone < 0)
+        {
+            std::vector<int> sourceFronts;
+            CollectCanonicalRotateWallComponent(canonicalTarget, sourceFronts);
+            if (sourceFronts.empty())
+            {
+                MessageBoxW(g_app.mainWindow, L"Could not detect a connected source wall block.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+                return true;
+            }
+
+            g_app.pendingMoveWallGroupSourceZone = canonicalTarget;
+            g_app.selectedZone = canonicalTarget;
+            RefreshPreviewImage();
+            UpdateModeButtons();
+            RefreshStatus();
+            InvalidateEditorViews();
+            return true;
+        }
+
+        std::vector<int> sourceFronts;
+        std::vector<int> guideFronts;
+        CollectCanonicalRotateWallComponent(g_app.pendingMoveWallGroupSourceZone, sourceFronts);
+        CollectCanonicalRotateWallComponent(canonicalTarget, guideFronts);
+        if (sourceFronts.empty() || guideFronts.empty() || WallRunsShareAnyZone(sourceFronts, guideFronts))
+        {
+            MessageBoxW(g_app.mainWindow,
+                L"Click a separate duplicate of the same wall block at the destination position. The source block itself cannot be used as its own target guide.",
+                L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+        if (sourceFronts.size() != guideFronts.size())
+        {
+            MessageBoxW(g_app.mainWindow,
+                L"The target guide block must have the same number of wall segments as the moving source block.",
+                L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+            return true;
+        }
+
+        PushUndoSnapshot();
+        const int eventIndex = EnsureTriggerHasEventSlot(g_app.linkEventTriggerZone);
+        if (eventIndex < 0)
+        {
+            UndoLastChange();
+            MessageBoxW(g_app.mainWindow, L"Could not assign an event slot to this trigger.", L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        int moveTargetZoneIndex = g_app.pendingMoveWallGroupSourceZone;
+        if (!AddMoveWallGroupLinkToEvent(eventIndex, g_app.pendingMoveWallGroupSourceZone, canonicalTarget, moveTargetZoneIndex))
+        {
+            UndoLastChange();
+            MessageBoxW(g_app.mainWindow,
+                L"Could not build a map1b-style move group. Draw/copy the same wall block at the final target position, then click source first and target second.",
+                L"ZGloom Editor", MB_OK | MB_ICONERROR);
+            return true;
+        }
+
+        g_app.linkEventIndex = eventIndex;
+        g_app.selectedZone = GetCanonicalWallIndex(moveTargetZoneIndex);
+        g_app.insertMode = InsertMode::None;
+        g_app.linkEventTriggerZone = -1;
+        ResetPendingMoveWallGroup();
+        MarkDirty();
+        RefreshZoneList();
+        RefreshPreviewImage();
+        UpdateModeButtons();
+        RefreshStatus();
+        InvalidateEditorViews();
+        return true;
+    }
+
     bool UpsertTeleportCommandToEvent(int eventIndex, POINT world, int rot)
     {
+        if (EventScriptHasAdvancedRaw(eventIndex)) return false;
         if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
         auto& commands = g_app.document.events[eventIndex].commands;
         for (auto& command : commands)
@@ -5601,6 +6994,55 @@ namespace
         return CommitPendingTeleportTarget();
     }
 
+    std::wstring EventSlotRoleText(int eventIndex)
+    {
+        if (eventIndex == kInitialEventIndex)
+        {
+            return L"Start/init";
+        }
+        if (eventIndex == (kLevelEndEventValue - 1))
+        {
+            return L"Exit / retrigger";
+        }
+        if (eventIndex >= 18 && eventIndex <= 22)
+        {
+            return L"Retrigger";
+        }
+        if (eventIndex >= 1 && eventIndex <= 17)
+        {
+            return L"Once";
+        }
+        return L"Event";
+    }
+
+    std::wstring EventSlotComboLabel(int eventIndex)
+    {
+        std::wstringstream ss;
+        ss << L"E" << (eventIndex + 1) << L" - " << EventSlotRoleText(eventIndex);
+        return ss.str();
+    }
+
+    bool EventScriptHasAdvancedRaw(int eventIndex)
+    {
+        return eventIndex >= 0 &&
+            eventIndex < static_cast<int>(g_app.document.events.size()) &&
+            g_app.document.events[eventIndex].hasUnsupportedRaw;
+    }
+
+    bool WarnIfEventScriptAdvancedRaw(int eventIndex)
+    {
+        if (!EventScriptHasAdvancedRaw(eventIndex))
+        {
+            return false;
+        }
+
+        std::wstringstream message;
+        message << L"Event " << (eventIndex + 1) << L" contains advanced/raw MAPED commands.\n\n"
+                << L"This editor preserves the original byte block exactly, but high-level editing is disabled for this event slot so Morph/Lock/other original logic cannot be damaged.";
+        MessageBoxW(g_app.mainWindow, message.str().c_str(), L"ZGloom Editor", MB_OK | MB_ICONINFORMATION);
+        return true;
+    }
+
     std::wstring FormatTextureIndexShort(int textureIndex)
     {
         textureIndex = ClampValue(textureIndex, 0, 159);
@@ -5620,6 +7062,72 @@ namespace
         }
     }
 
+    std::wstring FormatSelectedZoneValidationSummary(int zoneIndex)
+    {
+        if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size())) return std::wstring();
+        const auto& zone = g_app.document.zones[zoneIndex];
+        std::wstringstream summary;
+        bool wroteIssue = false;
+
+        auto addLine = [&](const wchar_t* tag, const std::wstring& text)
+        {
+            summary << L"  " << tag << L" " << text << L"\r\n";
+            wroteIssue = true;
+        };
+
+        if (IsLinearZoneType(zone.ztype) && zone.ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+            zone.ev != 0 && !IsLevelEndZone(zone) && EventSlotFromZoneEventValue(zone.ev) < 0)
+        {
+            addLine(L"[WARN]", L"Invalid Event ID. Use 1-24, or 0 for an inert helper line.");
+        }
+
+        if (IsEventTriggerLineZone(zone) && !IsLevelEndZone(zone))
+        {
+            const int eventIndex = EventSlotFromZoneEventValue(zone.ev);
+            if (eventIndex >= 0 && eventIndex < static_cast<int>(g_app.document.events.size()))
+            {
+                const auto& script = g_app.document.events[eventIndex];
+                if (script.hasUnsupportedRaw)
+                {
+                    addLine(L"[INFO]", L"This event has preserved raw MAPED bytes; high-level editing stays conservative.");
+                }
+                else if (script.commands.empty())
+                {
+                    addLine(L"[INFO]", L"This trigger points to an empty event slot.");
+                }
+            }
+        }
+
+        const std::vector<uint8_t> guideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        if (IsMoveWallGroupGuideZoneIndex(guideMask, zoneIndex))
+        {
+            const bool neutral = zone.a == 0 && zone.b == 0 && zone.na == 0 && zone.nb == 0 &&
+                zone.ln == 0 && zone.sc == 0 && zone.ev == 0 &&
+                std::all_of(zone.textures.begin(), zone.textures.end(), [](uint8_t t) { return t == 0; });
+            addLine(neutral ? L"[OK]" : L"[WARN]",
+                neutral ? L"Move-Wallblock guide is invisible and AI/collision-neutral."
+                        : L"Move-Wallblock guide should be invisible and AI/collision-neutral. Validate Map can repair this safely.");
+        }
+
+        int outOfCorpusTextures = 0;
+        for (uint8_t texture : zone.textures)
+        {
+            if (texture > 79) ++outOfCorpusTextures;
+        }
+        if (outOfCorpusTextures > 0)
+        {
+            std::wstringstream line;
+            line << outOfCorpusTextures << L" texture reference(s) are outside the shipped 0-79 corpus range.";
+            addLine(L"[INFO]", line.str());
+        }
+
+        if (!wroteIssue)
+        {
+            summary << L"  [OK] No immediate validation warning for the selected zone.\r\n";
+        }
+        return summary.str();
+    }
+
     std::wstring FormatEventLogicSummaryForZone(int zoneIndex)
     {
         if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size())) return std::wstring();
@@ -5635,10 +7143,29 @@ namespace
         if (IsEventTriggerLineZone(zone))
         {
             const int eventIndex = EventSlotFromZoneEventValue(zone.ev);
-            summary << L"Logic: crossing this line fires Event " << zone.ev << L".\r\n";
-            if (eventIndex >= 0)
+            summary << L"Logic: crossing this line fires Event " << zone.ev << L" (" << EventSlotRoleText(eventIndex) << L").\r\n";
+            if (eventIndex >= 0 && g_app.document.events[eventIndex].hasUnsupportedRaw)
+            {
+                summary << L"  Advanced/raw MAPED command block is preserved verbatim. Editing disabled for safety.\r\n";
+            }
+            if (eventIndex >= 0 && !g_app.document.events[eventIndex].hasUnsupportedRaw)
             {
                 const auto& commands = g_app.document.events[eventIndex].commands;
+
+                std::vector<std::wstring> quickDetails;
+                const auto targetZones = GetEventTargetZones(eventIndex);
+                if (!targetZones.empty())
+                {
+                    std::wstringstream targets;
+                    targets << L"targets ";
+                    for (size_t targetIndex = 0; targetIndex < targetZones.size(); ++targetIndex)
+                    {
+                        if (targetIndex) targets << L", ";
+                        targets << L"Z" << targetZones[targetIndex];
+                    }
+                    quickDetails.push_back(targets.str());
+                }
+
                 int addMonsterCount = 0;
                 int targetCount = 0;
                 int teleportCount = 0;
@@ -5649,6 +7176,14 @@ namespace
                     {
                     case mapfmt::CommandType::AddMonster:
                         ++addMonsterCount;
+                        {
+                            std::wstringstream spawn;
+                            spawn << L"spawn t" << command.params[0]
+                                  << L" x=" << command.params[1]
+                                  << L" z=" << command.params[3]
+                                  << L" r=" << (command.params[4] & 255);
+                            quickDetails.push_back(spawn.str());
+                        }
                         break;
                     case mapfmt::CommandType::LoadObjects:
                         ++loadObjectCount;
@@ -5664,6 +7199,16 @@ namespace
                     default:
                         break;
                     }
+                }
+                if (!quickDetails.empty())
+                {
+                    summary << L"  Details: ";
+                    for (size_t detailIndex = 0; detailIndex < quickDetails.size(); ++detailIndex)
+                    {
+                        if (detailIndex) summary << L" | ";
+                        summary << quickDetails[detailIndex];
+                    }
+                    summary << L"\r\n";
                 }
                 if (loadObjectCount) summary << L"  Load object list command(s): " << loadObjectCount << L"\r\n";
                 if (addMonsterCount) summary << L"  Spawns/adds objects: " << addMonsterCount << L" (shown as dashed yellow links)\r\n";
@@ -5713,7 +7258,7 @@ namespace
             for (int eventIndex : controllingEvents)
             {
                 const auto triggerZones = GetTriggerZonesForEvent(eventIndex);
-                summary << L"  Event " << (eventIndex + 1);
+                summary << L"  Event " << (eventIndex + 1) << L" (" << EventSlotRoleText(eventIndex) << L")";
                 if (!triggerZones.empty())
                 {
                     summary << L" from trigger" << (triggerZones.size() > 1 ? L"s " : L" ");
@@ -5724,7 +7269,11 @@ namespace
                     }
                 }
                 summary << L"\r\n";
-                if (eventIndex >= 0 && eventIndex < static_cast<int>(g_app.document.events.size()))
+                if (eventIndex >= 0 && eventIndex < static_cast<int>(g_app.document.events.size()) && g_app.document.events[eventIndex].hasUnsupportedRaw)
+                {
+                    summary << L"    Advanced/raw MAPED command block preserved.\r\n";
+                }
+                if (eventIndex >= 0 && eventIndex < static_cast<int>(g_app.document.events.size()) && !g_app.document.events[eventIndex].hasUnsupportedRaw)
                 {
                     for (const auto& command : g_app.document.events[eventIndex].commands)
                     {
@@ -6070,7 +7619,13 @@ namespace
                 {
                     label << L"M" << markerIndex << L" t" << monsterType << L" E" << (eventIndex + 1);
                 }
-                DrawZoneOverlayLabel(hdc, label.str(), p.x + 10, p.y - 18,
+                const std::wstring markerLabel = label.str();
+                SIZE markerLabelSize = MeasureZoneOverlayLabel(hdc, markerLabel);
+                POINT markerLabelPos = selected
+                    ? POINT{ p.x - markerLabelSize.cx - 12, p.y - markerLabelSize.cy - 12 }
+                    : POINT{ p.x + 10, p.y - 18 };
+                markerLabelPos = ClampZoneOverlayLabelPoint(rc, markerLabelSize, markerLabelPos);
+                DrawZoneOverlayLabel(hdc, markerLabel, markerLabelPos.x, markerLabelPos.y,
                     selected ? RGB(255, 255, 255) : (monsterType <= 1 ? RGB(145, 215, 255) : RGB(255, 218, 122)));
                 ++markerIndex;
             }
@@ -6097,7 +7652,26 @@ namespace
         LineTo(hdc, p2.x, p2.y);
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
-        DrawZoneOverlayLabel(hdc, label, MinValue(p1.x, p2.x) + 6, MaxValue(p1.y, p2.y) + 4, RGB(255, 245, 190));
+        // v49: Selection/logic labels use the cleaner classic placement again:
+        // left/above the affected line. For vertical or downward-running lines,
+        // keep the label outside on the left instead of pushing it to the right.
+        const SIZE labelSize = MeasureZoneOverlayLabel(hdc, label);
+        const int minX = MinValue(p1.x, p2.x);
+        const int minY = MinValue(p1.y, p2.y);
+        const int dx = std::abs(p2.x - p1.x);
+        const int dy = std::abs(p2.y - p1.y);
+        const bool verticalOrDownward = dy > dx || p2.y > p1.y;
+        POINT labelPos{};
+        if (verticalOrDownward)
+        {
+            labelPos = POINT{ minX - labelSize.cx - 10, minY - labelSize.cy - 6 };
+        }
+        else
+        {
+            labelPos = POINT{ minX + 4, minY - labelSize.cy - 8 };
+        }
+        labelPos = ClampZoneOverlayLabelPoint(rc, labelSize, labelPos);
+        DrawZoneOverlayLabel(hdc, label, labelPos.x, labelPos.y, RGB(255, 245, 190));
     }
 
     void DrawLogicConnectionLine(HDC hdc, const POINT& from, const POINT& to, COLORREF color)
@@ -6127,6 +7701,106 @@ namespace
         }
     }
 
+    void DrawEventGraphZoneLine(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, int zoneIndex, COLORREF color)
+    {
+        if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size())) return;
+        const auto& zone = g_app.document.zones[zoneIndex];
+        if (!IsLinearZoneType(zone.ztype)) return;
+        POINT p1 = WorldToScreen(rc, bounds, zone.x1, zone.z1);
+        POINT p2 = WorldToScreen(rc, bounds, zone.x2, zone.z2);
+        HPEN pen = CreatePen(PS_SOLID, 3, color);
+        HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, pen));
+        MoveToEx(hdc, p1.x, p1.y, nullptr);
+        LineTo(hdc, p2.x, p2.y);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+
+    POINT EventGraphRotateCommandCenterScreen(const mapfmt::EventCommand& command, const RECT& rc, const mapfmt::Bounds& bounds)
+    {
+        const int first = static_cast<int>(command.params[0]);
+        const int count = MaxValue(1, static_cast<int>(command.params[1]));
+        if (first < 0 || first >= static_cast<int>(g_app.document.zones.size()))
+        {
+            return POINT{0, 0};
+        }
+        const int safeCount = ClampValue(count, 1, static_cast<int>(g_app.document.zones.size()) - first);
+        POINT world = CalculateZoneRangeCenterWorld(first, safeCount);
+        return WorldToScreen(rc, bounds, world.x, world.y);
+    }
+
+    void DrawEventGraphOverlay(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds)
+    {
+        if (!g_app.showEventGraphOverlay) return;
+
+        int drawnLabels = 0;
+        constexpr int kMaxEventLabels = 28;
+        for (int triggerZone = 0; triggerZone < static_cast<int>(g_app.document.zones.size()); ++triggerZone)
+        {
+            const auto& trigger = g_app.document.zones[triggerZone];
+            if (!IsEventTriggerLineZone(trigger) || IsLevelEndZone(trigger))
+            {
+                continue;
+            }
+
+            const int eventIndex = EventSlotFromZoneEventValue(trigger.ev);
+            if (eventIndex < 0 || eventIndex >= static_cast<int>(g_app.document.events.size()))
+            {
+                continue;
+            }
+            const auto& script = g_app.document.events[eventIndex];
+            if (script.hasUnsupportedRaw || script.commands.empty())
+            {
+                continue;
+            }
+
+            const POINT from = ZoneCenterScreen(trigger, rc, bounds);
+            bool drewConnection = false;
+            for (const auto& command : script.commands)
+            {
+                switch (command.type)
+                {
+                case mapfmt::CommandType::OpenDoor:
+                case mapfmt::CommandType::ChangeTexture:
+                    if (command.params[0] >= 0 && command.params[0] < static_cast<int>(g_app.document.zones.size()))
+                    {
+                        DrawLogicConnectionLine(hdc, from, ZoneCenterScreen(g_app.document.zones[command.params[0]], rc, bounds), RGB(98, 190, 232));
+                        drewConnection = true;
+                    }
+                    break;
+                case mapfmt::CommandType::RotatePoly:
+                    if (command.params[0] >= 0 && command.params[0] < static_cast<int>(g_app.document.zones.size()))
+                    {
+                        DrawLogicConnectionLine(hdc, from, EventGraphRotateCommandCenterScreen(command, rc, bounds), RGB(116, 205, 255));
+                        drewConnection = true;
+                    }
+                    break;
+                case mapfmt::CommandType::Teleport:
+                    DrawLogicConnectionLine(hdc, from, WorldToScreen(rc, bounds, command.params[0], command.params[2]), RGB(182, 136, 255));
+                    drewConnection = true;
+                    break;
+                case mapfmt::CommandType::AddMonster:
+                    DrawLogicConnectionLine(hdc, from, WorldToScreen(rc, bounds, command.params[1], command.params[3]), RGB(255, 205, 86));
+                    drewConnection = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            if (drewConnection)
+            {
+                DrawEventGraphZoneLine(hdc, rc, bounds, triggerZone, RGB(255, 176, 48));
+                if (drawnLabels < kMaxEventLabels)
+                {
+                    const std::wstring label = L"E" + std::to_wstring(eventIndex + 1);
+                    DrawZoneOverlayLabel(hdc, label, from.x + 5, from.y - 18, RGB(255, 235, 150));
+                    ++drawnLabels;
+                }
+            }
+        }
+    }
+
     void DrawEventLogicOverlay(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds)
     {
         if ((g_app.insertMode == InsertMode::LinkEventToZone ||
@@ -6135,6 +7809,7 @@ namespace
              g_app.insertMode == InsertMode::DeleteLinkEventToEnemyObject ||
              g_app.insertMode == InsertMode::LinkEventToRotateClockwise ||
              g_app.insertMode == InsertMode::LinkEventToRotateCounterClockwise ||
+             g_app.insertMode == InsertMode::LinkEventToMoveWallGroup ||
              g_app.insertMode == InsertMode::SetTeleportTarget) &&
             g_app.linkEventTriggerZone >= 0 && g_app.linkEventTriggerZone < static_cast<int>(g_app.document.zones.size()))
         {
@@ -6157,7 +7832,11 @@ namespace
                 }
                 if (triggers.empty())
                 {
-                    DrawZoneOverlayLabel(hdc, L"Teleport E" + std::to_wstring(eventIndex + 1), targetCenter.x + 12, targetCenter.y + 12, RGB(220, 190, 255));
+                    const std::wstring teleportLabel = L"Teleport E" + std::to_wstring(eventIndex + 1);
+                    const SIZE teleportLabelSize = MeasureZoneOverlayLabel(hdc, teleportLabel);
+                    POINT teleportLabelPos{ targetCenter.x - teleportLabelSize.cx - 12, targetCenter.y - teleportLabelSize.cy - 12 };
+                    teleportLabelPos = ClampZoneOverlayLabelPoint(rc, teleportLabelSize, teleportLabelPos);
+                    DrawZoneOverlayLabel(hdc, teleportLabel, teleportLabelPos.x, teleportLabelPos.y, RGB(220, 190, 255));
                 }
             }
             return;
@@ -6177,7 +7856,11 @@ namespace
                     DrawHighlightedZoneLine(hdc, rc, bounds, triggerZone, RGB(255, 176, 48), L"Trigger E" + std::to_wstring(eventIndex + 1));
                     DrawLogicConnectionLine(hdc, ZoneCenterScreen(g_app.document.zones[triggerZone], rc, bounds), spawnCenter, RGB(255, 205, 86));
                 }
-                DrawZoneOverlayLabel(hdc, L"Spawn E" + std::to_wstring(eventIndex + 1), spawnCenter.x + 12, spawnCenter.y + 12, RGB(255, 225, 145));
+                const std::wstring spawnLabel = L"Spawn E" + std::to_wstring(eventIndex + 1);
+                const SIZE spawnLabelSize = MeasureZoneOverlayLabel(hdc, spawnLabel);
+                POINT spawnLabelPos{ spawnCenter.x - spawnLabelSize.cx - 12, spawnCenter.y - spawnLabelSize.cy - 12 };
+                spawnLabelPos = ClampZoneOverlayLabelPoint(rc, spawnLabelSize, spawnLabelPos);
+                DrawZoneOverlayLabel(hdc, spawnLabel, spawnLabelPos.x, spawnLabelPos.y, RGB(255, 225, 145));
             }
             return;
         }
@@ -6207,6 +7890,7 @@ namespace
                     }
                 }
                 DrawEventSpawnConnectionLines(hdc, rc, bounds, eventIndex, triggerCenter);
+                DrawMoveWallGroupEventPaths(hdc, rc, bounds, eventIndex);
             }
             return;
         }
@@ -6226,6 +7910,117 @@ namespace
                 }
             }
         }
+    }
+
+    void CancelMonsterSpawnDrag(bool refreshViews)
+    {
+        g_app.monsterSpawnDragging = false;
+        g_app.monsterSpawnDragMoved = false;
+        g_app.monsterSpawnDragSnapshotTaken = false;
+        g_app.monsterSpawnDragSelection.Clear();
+        if (refreshViews)
+        {
+            RefreshStatus();
+            InvalidateEditorViews();
+        }
+    }
+
+    bool BeginMonsterSpawnDrag(const MonsterSpawnSelection& selection, POINT clientPoint, const RECT& rc)
+    {
+        if (!selection.IsSet()) return false;
+        if (selection.eventIndex < 0 || selection.eventIndex >= static_cast<int>(g_app.document.events.size())) return false;
+        auto& commands = g_app.document.events[selection.eventIndex].commands;
+        if (selection.commandIndex < 0 || selection.commandIndex >= static_cast<int>(commands.size())) return false;
+        auto& command = commands[selection.commandIndex];
+        if (command.type != mapfmt::CommandType::AddMonster) return false;
+
+        g_app.monsterSpawnDragging = true;
+        g_app.monsterSpawnDragMoved = false;
+        g_app.monsterSpawnDragSnapshotTaken = false;
+        g_app.monsterSpawnDragSelection = selection;
+        g_app.monsterSpawnDragStartClient = clientPoint;
+        g_app.monsterSpawnDragStartWorld = ScreenToWorld(rc, g_app.document.ComputeBounds(), clientPoint.x, clientPoint.y);
+        g_app.monsterSpawnDragStartX = command.params[1];
+        g_app.monsterSpawnDragStartZ = command.params[3];
+        return true;
+    }
+
+    bool UpdateMonsterSpawnDrag(POINT clientPoint, const RECT& rc)
+    {
+        if (!g_app.monsterSpawnDragging) return false;
+        const int dxClient = clientPoint.x - g_app.monsterSpawnDragStartClient.x;
+        const int dyClient = clientPoint.y - g_app.monsterSpawnDragStartClient.y;
+        if (!g_app.monsterSpawnDragSnapshotTaken)
+        {
+            if ((dxClient * dxClient + dyClient * dyClient) < 9)
+            {
+                return true;
+            }
+            PushUndoSnapshot();
+            g_app.monsterSpawnDragSnapshotTaken = true;
+        }
+
+        if (g_app.monsterSpawnDragSelection.eventIndex < 0 ||
+            g_app.monsterSpawnDragSelection.eventIndex >= static_cast<int>(g_app.document.events.size()))
+        {
+            CancelMonsterSpawnDrag(false);
+            return false;
+        }
+
+        auto& commands = g_app.document.events[g_app.monsterSpawnDragSelection.eventIndex].commands;
+        if (g_app.monsterSpawnDragSelection.commandIndex < 0 ||
+            g_app.monsterSpawnDragSelection.commandIndex >= static_cast<int>(commands.size()))
+        {
+            CancelMonsterSpawnDrag(false);
+            return false;
+        }
+
+        auto& command = commands[g_app.monsterSpawnDragSelection.commandIndex];
+        if (command.type != mapfmt::CommandType::AddMonster)
+        {
+            CancelMonsterSpawnDrag(false);
+            return false;
+        }
+
+        const POINT world = ScreenToWorld(rc, g_app.document.ComputeBounds(), clientPoint.x, clientPoint.y);
+        const int newX = g_app.monsterSpawnDragStartX + (world.x - g_app.monsterSpawnDragStartWorld.x);
+        const int newZ = g_app.monsterSpawnDragStartZ + (world.y - g_app.monsterSpawnDragStartWorld.y);
+        command.params[1] = ClampWorldToInt16(newX);
+        command.params[3] = ClampWorldToInt16(newZ);
+        g_app.monsterSpawnDragMoved = true;
+
+        if (g_app.monsterSpawnDragSelection.eventIndex == kInitialEventIndex && command.params[0] == kPlayer1ObjectType)
+        {
+            g_app.walkPreviewX = static_cast<double>(command.params[1]);
+            g_app.walkPreviewZ = static_cast<double>(command.params[3]);
+            g_app.walkPreviewInitialized = true;
+        }
+
+        RefreshPreviewImage();
+        RefreshStatus();
+        InvalidateEditorViews();
+        return true;
+    }
+
+    bool FinishMonsterSpawnDrag()
+    {
+        if (!g_app.monsterSpawnDragging) return false;
+        const bool moved = g_app.monsterSpawnDragMoved;
+        CancelMonsterSpawnDrag(false);
+        if (moved)
+        {
+            MarkDirty();
+            RefreshZoneList();
+            RefreshPreviewImage();
+            UpdateModeButtons();
+            RefreshStatus();
+            InvalidateEditorViews();
+        }
+        else
+        {
+            RefreshStatus();
+        }
+        return true;
     }
 
     MonsterSpawnSelection HitTestMonsterSpawn(int sx, int sy, const RECT& rc)
@@ -6453,6 +8248,135 @@ namespace
         return slash == std::string::npos ? trimmed : trimmed.substr(slash + 1);
     }
 
+    bool FileExistsLocal(const std::string& path)
+    {
+        if (path.empty()) return false;
+        const DWORD attrs = GetFileAttributesA(path.c_str());
+        return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    std::string NormalizePathForProfileCompare(std::string path)
+    {
+        std::replace(path.begin(), path.end(), '\\', '/');
+        return LowerAscii(path);
+    }
+
+    bool PathContainsFolderPair(const std::string& normalizedPath, const char* gameFolder, const char* mapFolder)
+    {
+        if (!gameFolder || !mapFolder) return false;
+        const std::string needle = std::string("/") + LowerAscii(gameFolder) + "/" + LowerAscii(mapFolder) + "/";
+        return normalizedPath.find(needle) != std::string::npos;
+    }
+
+    GameProfile MakeGameProfile(GameProfileKind kind, const std::string& rootPath)
+    {
+        GameProfile profile;
+        profile.kind = kind;
+        profile.rootPath = TrimTrailingSlashes(rootPath);
+        switch (kind)
+        {
+        case GameProfileKind::Gloom:
+            profile.title = L"Gloom";
+            profile.mapFolder = "maps";
+            profile.objectFolder = "objs";
+            profile.imageFolder = "pics";
+            profile.soundFolder = "sfxs";
+            profile.scriptPath = "misc/script";
+            break;
+        case GameProfileKind::GloomDeluxe:
+            profile.title = L"Gloom Deluxe";
+            profile.mapFolder = "maps";
+            profile.objectFolder = "objs";
+            profile.imageFolder = "pics";
+            profile.soundFolder = "sfxs";
+            profile.scriptPath = "misc/script";
+            break;
+        case GameProfileKind::Gloom3:
+            profile.title = L"Gloom 3";
+            profile.mapFolder = "maps";
+            profile.objectFolder = "objs";
+            profile.imageFolder = "pics";
+            profile.soundFolder = "sfxs";
+            profile.scriptPath = "misc/script";
+            break;
+        case GameProfileKind::ZombieMassacre:
+            profile.title = L"Zombie Massacre";
+            profile.mapFolder = "lvls";
+            profile.objectFolder = "char";
+            profile.imageFolder = "pixs";
+            profile.soundFolder = "musi";
+            profile.scriptPath = "stuf/stages";
+            break;
+        case GameProfileKind::Unknown:
+        default:
+            profile.title = L"Unknown Game";
+            break;
+        }
+        return profile;
+    }
+
+    GameProfile DetectGameProfileForMapPath(const std::string& path)
+    {
+        if (path.empty())
+        {
+            return MakeGameProfile(GameProfileKind::Unknown, std::string());
+        }
+
+        const std::string mapDir = DirName(path);
+        const std::string projectDir = DirName(mapDir);
+        const std::string normalized = NormalizePathForProfileCompare(path);
+        const std::string mapDirName = LowerAscii(BaseNameNoSlash(mapDir));
+        const bool mapLivesInKnownMapFolder = mapDirName == "maps" || mapDirName == "lvls";
+        const std::string gameRoot = mapLivesInKnownMapFolder ? projectDir : mapDir;
+        const std::string gameRootName = LowerAscii(BaseNameNoSlash(gameRoot));
+
+        if (PathContainsFolderPair(normalized, "massacre", "lvls") ||
+            mapDirName == "lvls" ||
+            gameRootName == "massacre" ||
+            DirectoryExistsLocal(JoinPath(gameRoot, "char")) ||
+            FileExistsLocal(JoinPath(gameRoot, "stuf/stages")))
+        {
+            return MakeGameProfile(GameProfileKind::ZombieMassacre, gameRoot);
+        }
+
+        if (PathContainsFolderPair(normalized, "gloom3", "maps") ||
+            gameRootName == "gloom3" ||
+            DirectoryExistsLocal(JoinPath(gameRoot, "fonts")))
+        {
+            return MakeGameProfile(GameProfileKind::Gloom3, gameRoot);
+        }
+
+        if (PathContainsFolderPair(normalized, "deluxe", "maps") ||
+            gameRootName == "deluxe" ||
+            FileExistsLocal(JoinPath(gameRoot, "pics/blackmagic")))
+        {
+            return MakeGameProfile(GameProfileKind::GloomDeluxe, gameRoot);
+        }
+
+        if (PathContainsFolderPair(normalized, "gloom", "maps") ||
+            gameRootName == "gloom" ||
+            FileExistsLocal(JoinPath(gameRoot, "misc/script")))
+        {
+            return MakeGameProfile(GameProfileKind::Gloom, gameRoot);
+        }
+
+        return MakeGameProfile(GameProfileKind::Unknown, gameRoot);
+    }
+
+    void RefreshGameProfile()
+    {
+        const GameProfile previous = g_app.gameProfile;
+        g_app.gameProfile = DetectGameProfileForMapPath(g_app.document.sourcePath);
+        if (previous.kind != g_app.gameProfile.kind || previous.rootPath != g_app.gameProfile.rootPath)
+        {
+            g_app.objectPreviewCache.clear();
+        }
+        if (g_app.statusBar)
+        {
+            InvalidateRect(g_app.statusBar, nullptr, TRUE);
+        }
+    }
+
     std::string GetConfiguredTextureFolder()
     {
         const std::string configured = TrimTrailingSlashes(g_app.textureDataPath);
@@ -6523,6 +8447,7 @@ namespace
         case InsertMode::DeleteLinkEventToEnemyObject: return L"Delete Link Event";
         case InsertMode::LinkEventToRotateClockwise: return L"Link Event > Rotate CW";
         case InsertMode::LinkEventToRotateCounterClockwise: return L"Link Event > Rotate CCW";
+        case InsertMode::LinkEventToMoveWallGroup: return L"Link Event > Move Wallblock";
         case InsertMode::SetTeleportTarget: return L"Set Teleport Target";
         default: return L"Select";
         }
@@ -6551,6 +8476,22 @@ namespace
         if (g_app.infoPanel) InvalidateRect(g_app.infoPanel, nullptr, FALSE);
     }
 
+    bool HasMapContentForValidation()
+    {
+        if (!g_app.document.zones.empty())
+        {
+            return true;
+        }
+        for (const auto& script : g_app.document.events)
+        {
+            if (script.hasUnsupportedRaw || !script.commands.empty())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void UpdateModeButtons()
     {
         if (!g_app.btnAddWall) return;
@@ -6567,6 +8508,10 @@ namespace
         if (g_app.btnLinkEnemyObjects) SetWindowTextW(g_app.btnLinkEnemyObjects, g_app.insertMode == InsertMode::LinkEventToEnemyObject ? L"Click Enemy/Object..." : L"Link Event > Enemy/Objects");
         if (g_app.btnLinkRotateCW) SetWindowTextW(g_app.btnLinkRotateCW, g_app.insertMode == InsertMode::LinkEventToRotateClockwise ? L"Click Rotate Target..." : L"Link Event > Rotate CW");
         if (g_app.btnLinkRotateCCW) SetWindowTextW(g_app.btnLinkRotateCCW, g_app.insertMode == InsertMode::LinkEventToRotateCounterClockwise ? L"Click Rotate Target..." : L"Link Event > Rotate CCW");
+        if (g_app.btnLinkMoveWallGroup) SetWindowTextW(g_app.btnLinkMoveWallGroup,
+            g_app.insertMode == InsertMode::LinkEventToMoveWallGroup
+                ? (g_app.pendingMoveWallGroupTargetPlacementActive ? L"Place Move Target..." : L"Click Move Block...")
+                : L"Link Event > Move Wallblock");
         if (g_app.btnDeleteLinkEvent)
         {
             SetWindowTextW(g_app.btnDeleteLinkEvent, L"Delete Link Event");
@@ -6578,6 +8523,10 @@ namespace
                 : L"Set Teleport Target");
         if (g_app.btnFlipDoorDirection) SetWindowTextW(g_app.btnFlipDoorDirection, IsZoneControlledByOpenDoor(g_app.selectedZone) ? L"Flip Door Direction" : L"Flip Line Direction");
         if (g_app.btnDelete) SetWindowTextW(g_app.btnDelete, IsSelectedTeleportTargetValid() ? L"Delete Teleport" : (IsSelectedMonsterSpawnValid() ? L"Delete Object" : L"Delete Zone"));
+        if (g_app.btnValidateMap)
+        {
+            EnableWindow(g_app.btnValidateMap, HasMapContentForValidation() ? TRUE : FALSE);
+        }
     }
 
     void ClearInsertMode()
@@ -6587,6 +8536,7 @@ namespace
         g_app.drawWallAngleLock = false;
         g_app.linkEventTriggerZone = -1;
         g_app.linkEventIndex = -1;
+        ResetPendingMoveWallGroup();
         ResetPendingTeleportTarget();
         UpdateModeButtons();
         RefreshPreviewImage();
@@ -6609,6 +8559,11 @@ namespace
             if (GetCapture() == g_app.canvas) ReleaseCapture();
             changed = true;
         }
+        if (g_app.pendingMoveWallGroupTargetPlacementActive)
+        {
+            if (GetCapture() == g_app.canvas) ReleaseCapture();
+            changed = true;
+        }
         if (g_app.insertMode != InsertMode::None)
         {
             g_app.insertMode = InsertMode::None;
@@ -6618,6 +8573,7 @@ namespace
         g_app.drawWallLengthSnapLock = false;
         g_app.linkEventTriggerZone = -1;
         g_app.linkEventIndex = -1;
+        ResetPendingMoveWallGroup();
         ResetPendingTeleportTarget();
         if (changed)
         {
@@ -7298,6 +9254,17 @@ namespace
         {
             ss << L"  Click the wall/poly group that should rotate";
         }
+        else if (g_app.insertMode == InsertMode::LinkEventToMoveWallGroup)
+        {
+            if (g_app.pendingMoveWallGroupTargetPlacementActive)
+            {
+                ss << L"  Move the copied block on the 8/8 grid, then click to place its target guide";
+            }
+            else
+            {
+                ss << L"  Click one segment of the source wall block that should move";
+            }
+        }
         else if (g_app.insertMode == InsertMode::SetTeleportTarget)
         {
             if (g_app.teleportTargetAwaitDirection)
@@ -7314,10 +9281,14 @@ namespace
             ss << L"  Click and drag on the canvas to draw";
         }
 
-        const std::wstring text = L"ESC quits current task | " + ss.str();
+        if (g_app.showEventGraphOverlay)
+        {
+            ss << L"  Event Links Overlay: ON";
+        }
+
+        const std::wstring text = ss.str();
         g_app.statusText = text;
-        SetWindowTextW(g_app.statusBar, text.c_str());
-        InvalidateRect(g_app.statusBar, nullptr, TRUE);
+        RedrawWindow(g_app.statusBar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
     }
 
     void RefreshZoneList()
@@ -7487,8 +9458,23 @@ namespace
             if (path.empty()) return false;
         }
 
-        for (auto& zone : g_app.document.zones)
+        if (!ConfirmSaveWithValidationAndMaybeFixes(path))
         {
+            return false;
+        }
+
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        for (int zoneIndex = 0; zoneIndex < static_cast<int>(g_app.document.zones.size()); ++zoneIndex)
+        {
+            auto& zone = g_app.document.zones[static_cast<size_t>(zoneIndex)];
+            if (IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, zoneIndex))
+            {
+                // Keep hidden Move-Wallblock target guides neutral while saving.
+                // The normal wall texture-band update derives sc from length and
+                // would otherwise undo Apply Safe Fixes by restoring sc=2/4/etc.
+                MakeMoveWallGroupGuideAiNeutral(zone);
+                continue;
+            }
             UpdateWallTextureBandCountFromLength(zone);
         }
 
@@ -7502,6 +9488,7 @@ namespace
 
         g_app.document.sourcePath = path;
         g_app.document.dirty = false;
+        RefreshGameProfile();
         AddRecentFile(path);
         UpdateTitle();
         RefreshStatus();
@@ -7512,6 +9499,7 @@ namespace
     {
         if (!ConfirmDiscardChanges()) return;
         g_app.document.NewBlank();
+        RefreshGameProfile();
         g_app.objectPreviewCache.clear();
         ClearUndoHistory();
         g_app.selectedZone = -1;
@@ -7548,6 +9536,7 @@ namespace
             return false;
         }
 
+        RefreshGameProfile();
         g_app.objectPreviewCache.clear();
         ClearUndoHistory();
         g_app.selectedZone = g_app.document.zones.empty() ? -1 : 0;
@@ -7988,6 +9977,12 @@ namespace
             state = reinterpret_cast<EditorSettingsDialogState*>(lParam);
             SetWindowLongPtrW(dlg, DWLP_USER, lParam);
             CenterDialogOnOwner(dlg, g_app.mainWindow);
+            HICON smallIcon = static_cast<HICON>(LoadImageW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR | LR_SHARED));
+            HICON bigIcon = static_cast<HICON>(LoadImageW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR | LR_SHARED));
+            if (!smallIcon) smallIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+            if (!bigIcon) bigIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+            SendMessageW(dlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+            SendMessageW(dlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
             ApplyEditorDarkModeToWindowTree(dlg);
             SetWindowTextUtf8(GetDlgItem(dlg, IDC_SETTINGS_TEXTURE_ROOT), state->textureDataPath);
             UpdateEditorSettingsStatus(dlg, state);
@@ -8550,7 +10545,7 @@ namespace
         std::string message;
         if (!state || state->foundTextureNames.empty())
         {
-            message = "No wall textures found. Check Tools > Editor Settings and point it to the game data/txts folder.";
+            message = "No wall textures found. Check File > Editor Settings and point it to the game data/txts folder.";
         }
         else
         {
@@ -9534,11 +11529,16 @@ namespace
         HWND list = GetDlgItem(dlg, IDC_EVENT_COMMANDS);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         if (!state || !state->document) return;
-        const auto& commands = state->document->events[state->slotIndex].commands;
+        const auto& script = state->document->events[state->slotIndex];
+        const auto& commands = script.commands;
         for (const auto& cmd : commands)
         {
             const auto text = Utf8ToWide(cmd.ToDisplayString());
             SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        }
+        if (script.hasUnsupportedRaw)
+        {
+            SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"High-level editing disabled: original MAPED bytes will be preserved."));
         }
     }
 
@@ -9553,12 +11553,17 @@ namespace
             ApplyEditorDarkModeToWindowTree(dlg);
             for (int i = 0; i < mapfmt::MapDocument::kEventCount; ++i)
             {
-                std::wstringstream ss;
-                ss << (i + 1);
-                SendDlgItemMessageW(dlg, IDC_EVENT_SLOT, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(ss.str().c_str()));
+                const std::wstring label = EventSlotComboLabel(i);
+                SendDlgItemMessageW(dlg, IDC_EVENT_SLOT, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
             }
             SendDlgItemMessageW(dlg, IDC_EVENT_SLOT, CB_SETCURSEL, state->slotIndex, 0);
             PopulateEventCommandList(dlg, state);
+            const BOOL editable = state->document && !state->document->events[state->slotIndex].hasUnsupportedRaw;
+            EnableWindow(GetDlgItem(dlg, IDC_EVENT_ADD), editable);
+            EnableWindow(GetDlgItem(dlg, IDC_EVENT_EDIT), editable);
+            EnableWindow(GetDlgItem(dlg, IDC_EVENT_DELETE), editable);
+            EnableWindow(GetDlgItem(dlg, IDC_EVENT_UP), editable);
+            EnableWindow(GetDlgItem(dlg, IDC_EVENT_DOWN), editable);
             return TRUE;
         }
 
@@ -9579,7 +11584,9 @@ namespace
         case WM_COMMAND:
         {
             HWND list = GetDlgItem(dlg, IDC_EVENT_COMMANDS);
-            auto& commands = state->document->events[state->slotIndex].commands;
+            auto& script = state->document->events[state->slotIndex];
+            auto& commands = script.commands;
+            const bool eventEditable = !script.hasUnsupportedRaw;
             switch (LOWORD(wParam))
             {
             case IDC_EVENT_SLOT:
@@ -9587,10 +11594,17 @@ namespace
                 {
                     state->slotIndex = static_cast<int>(SendDlgItemMessageW(dlg, IDC_EVENT_SLOT, CB_GETCURSEL, 0, 0));
                     PopulateEventCommandList(dlg, state);
+                    const BOOL editable = state->document && !state->document->events[state->slotIndex].hasUnsupportedRaw;
+                    EnableWindow(GetDlgItem(dlg, IDC_EVENT_ADD), editable);
+                    EnableWindow(GetDlgItem(dlg, IDC_EVENT_EDIT), editable);
+                    EnableWindow(GetDlgItem(dlg, IDC_EVENT_DELETE), editable);
+                    EnableWindow(GetDlgItem(dlg, IDC_EVENT_UP), editable);
+                    EnableWindow(GetDlgItem(dlg, IDC_EVENT_DOWN), editable);
                 }
                 break;
             case IDC_EVENT_ADD:
             {
+                if (!eventEditable) break;
                 mapfmt::EventCommand cmd;
                 cmd.type = mapfmt::CommandType::AddMonster;
                 if (ShowCommandDialog(cmd))
@@ -9604,6 +11618,7 @@ namespace
             }
             case IDC_EVENT_EDIT:
             {
+                if (!eventEditable) break;
                 const int sel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
                 if (sel >= 0 && sel < static_cast<int>(commands.size()))
                 {
@@ -9620,6 +11635,7 @@ namespace
             }
             case IDC_EVENT_DELETE:
             {
+                if (!eventEditable) break;
                 const int sel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
                 if (sel >= 0 && sel < static_cast<int>(commands.size()))
                 {
@@ -9631,6 +11647,7 @@ namespace
             }
             case IDC_EVENT_UP:
             {
+                if (!eventEditable) break;
                 const int sel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
                 if (sel > 0 && sel < static_cast<int>(commands.size()))
                 {
@@ -9643,6 +11660,7 @@ namespace
             }
             case IDC_EVENT_DOWN:
             {
+                if (!eventEditable) break;
                 const int sel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
                 if (sel >= 0 && sel + 1 < static_cast<int>(commands.size()))
                 {
@@ -9912,15 +11930,1387 @@ namespace
         }
     }
 
+    std::wstring FormatYesNo(bool value)
+    {
+        return value ? L"yes" : L"no";
+    }
+
+    std::wstring FormatObjectTypeList(const std::vector<int>& values)
+    {
+        if (values.empty()) return L"none";
+        std::wstringstream ss;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            if (i) ss << L", ";
+            ss << values[i];
+        }
+        return ss.str();
+    }
+
+    void AddSortedUniqueInt(std::vector<int>& values, int value)
+    {
+        if (std::find(values.begin(), values.end(), value) == values.end())
+        {
+            values.push_back(value);
+            std::sort(values.begin(), values.end());
+        }
+    }
+
+    int CountValidationTagOccurrences(const std::wstring& text, const wchar_t* tag)
+    {
+        if (!tag || !*tag) return 0;
+        int count = 0;
+        size_t pos = 0;
+        const size_t tagLen = std::wcslen(tag);
+        while ((pos = text.find(tag, pos)) != std::wstring::npos)
+        {
+            ++count;
+            pos += tagLen;
+        }
+        return count;
+    }
+
+    std::wstring FormatLimitedWideList(const std::vector<std::wstring>& values, size_t limit = 8)
+    {
+        if (values.empty()) return L"none";
+        std::wstringstream ss;
+        const size_t shown = MinValue(values.size(), limit);
+        for (size_t i = 0; i < shown; ++i)
+        {
+            if (i) ss << L"; ";
+            ss << values[i];
+        }
+        if (values.size() > shown)
+        {
+            ss << L"; ... +" << (values.size() - shown) << L" more";
+        }
+        return ss.str();
+    }
+
+    bool WorldPointOutsideBoundsWithMargin(int x, int z, const mapfmt::Bounds& bounds, int margin)
+    {
+        if (!bounds.valid) return false;
+        return x < bounds.minX - margin || x > bounds.maxX + margin ||
+               z < bounds.minZ - margin || z > bounds.maxZ + margin;
+    }
+
+    void AddValidationIssueLine(std::vector<std::wstring>& issues, const std::wstring& line)
+    {
+        if (!line.empty())
+        {
+            issues.push_back(line);
+        }
+    }
+
+    MapValidationReportSections BuildMapValidationReportSections()
+    {
+        RefreshGameProfile();
+
+        int wallCount = 0;
+        int triggerCount = 0;
+        int monsterLineCount = 0;
+        int levelEndCount = 0;
+        int unusualScCount = 0;
+        int eventOneTriggerCount = 0;
+        int textureOutOfCorpusCount = 0;
+        std::vector<int> usedTextures;
+        std::vector<int> invalidTriggerEventZones;
+
+        for (size_t i = 0; i < g_app.document.zones.size(); ++i)
+        {
+            const auto& zone = g_app.document.zones[i];
+            if (zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall))
+            {
+                ++wallCount;
+                if (zone.sc < -8 || zone.sc > 16) ++unusualScCount;
+            }
+            else if (IsLevelEndZone(zone))
+            {
+                ++levelEndCount;
+            }
+            else if (IsEventTriggerLineZone(zone))
+            {
+                ++triggerCount;
+                if (zone.ev == 1) ++eventOneTriggerCount;
+            }
+            else if (zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::MonsterZone))
+            {
+                ++monsterLineCount;
+            }
+
+            if (IsLinearZoneType(zone.ztype) && zone.ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+                zone.ev != 0 && !IsLevelEndZone(zone) && EventSlotFromZoneEventValue(zone.ev) < 0)
+            {
+                AddSortedUniqueInt(invalidTriggerEventZones, static_cast<int>(i));
+            }
+
+            for (uint8_t texture : zone.textures)
+            {
+                const int textureId = static_cast<int>(texture);
+                AddSortedUniqueInt(usedTextures, textureId);
+                if (textureId > 79) ++textureOutOfCorpusCount;
+            }
+        }
+
+        int addObjectCount = 0;
+        int openDoorCount = 0;
+        int teleportCount = 0;
+        int loadObjectsCount = 0;
+        int changeTextureCount = 0;
+        int rotatePolyCount = 0;
+        int moveWallBlockCount = 0;
+        int unsupportedEventCount = 0;
+        bool hasP1Start = false;
+        bool hasP2Start = false;
+        std::vector<int> objectTypes;
+        std::vector<int> triggerlessEvents;
+        std::vector<int> emptyTriggeredEvents;
+        std::vector<int> nonNeutralMoveGuides;
+        std::vector<std::wstring> invalidZoneReferences;
+        std::vector<std::wstring> objectOutsideMapIssues;
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        const mapfmt::Bounds validationBounds = g_app.document.ComputeBounds();
+
+        for (int eventIndex = 0; eventIndex < static_cast<int>(g_app.document.events.size()); ++eventIndex)
+        {
+            const auto& script = g_app.document.events[eventIndex];
+            if (script.hasUnsupportedRaw)
+            {
+                ++unsupportedEventCount;
+                continue;
+            }
+
+            const bool hasCommands = !script.commands.empty();
+            const bool hasTrigger = EventHasActiveTrigger(eventIndex);
+            if (eventIndex > kInitialEventIndex && hasCommands && !hasTrigger)
+            {
+                triggerlessEvents.push_back(eventIndex + 1);
+            }
+            if (eventIndex > kInitialEventIndex && hasTrigger && !hasCommands)
+            {
+                emptyTriggeredEvents.push_back(eventIndex + 1);
+            }
+
+            for (const auto& command : script.commands)
+            {
+                switch (command.type)
+                {
+                case mapfmt::CommandType::AddMonster:
+                    ++addObjectCount;
+                    AddSortedUniqueInt(objectTypes, static_cast<int>(command.params[0]));
+                    if (eventIndex == kInitialEventIndex && command.params[0] == kPlayer1ObjectType) hasP1Start = true;
+                    if (eventIndex == kInitialEventIndex && command.params[0] == kPlayer2ObjectType) hasP2Start = true;
+                    if (WorldPointOutsideBoundsWithMargin(command.params[1], command.params[3], validationBounds, kGridStep))
+                    {
+                        std::wstringstream issue;
+                        issue << L"Event " << (eventIndex + 1) << L" command " << (&command - script.commands.data() + 1)
+                              << L" object type " << command.params[0]
+                              << L" at X " << command.params[1] << L" Z " << command.params[3];
+                        AddValidationIssueLine(objectOutsideMapIssues, issue.str());
+                    }
+                    break;
+                case mapfmt::CommandType::OpenDoor:
+                    ++openDoorCount;
+                    if (command.params[0] < 0 || command.params[0] >= static_cast<int>(g_app.document.zones.size()))
+                    {
+                        std::wstringstream issue;
+                        issue << L"Event " << (eventIndex + 1) << L" OpenDoor targets missing Z" << command.params[0];
+                        AddValidationIssueLine(invalidZoneReferences, issue.str());
+                    }
+                    break;
+                case mapfmt::CommandType::Teleport:
+                    ++teleportCount;
+                    break;
+                case mapfmt::CommandType::LoadObjects:
+                    ++loadObjectsCount;
+                    break;
+                case mapfmt::CommandType::ChangeTexture:
+                    ++changeTextureCount;
+                    if (command.params[0] < 0 || command.params[0] >= static_cast<int>(g_app.document.zones.size()))
+                    {
+                        std::wstringstream issue;
+                        issue << L"Event " << (eventIndex + 1) << L" ChangeTexture targets missing Z" << command.params[0];
+                        AddValidationIssueLine(invalidZoneReferences, issue.str());
+                    }
+                    break;
+                case mapfmt::CommandType::RotatePoly:
+                    ++rotatePolyCount;
+                    {
+                        const int first = static_cast<int>(command.params[0]);
+                        const int rawCount = static_cast<int>(command.params[1]);
+                        const int count = MaxValue(1, rawCount);
+                        if (first < 0 || rawCount <= 0 || first + count > static_cast<int>(g_app.document.zones.size()))
+                        {
+                            std::wstringstream issue;
+                            issue << L"Event " << (eventIndex + 1) << L" RotatePoly range Z" << first << L" count " << rawCount << L" is outside the map zone list";
+                            AddValidationIssueLine(invalidZoneReferences, issue.str());
+                        }
+                    }
+                    if (IsMoveWallGroupRotateCommand(command))
+                    {
+                        ++moveWallBlockCount;
+                        const int first = static_cast<int>(command.params[0]);
+                        const int count = MaxValue(1, static_cast<int>(command.params[1]));
+                        const int guideFirst = first + count;
+                        if (guideFirst < 0 || guideFirst + count > static_cast<int>(g_app.document.zones.size()))
+                        {
+                            std::wstringstream issue;
+                            issue << L"Event " << (eventIndex + 1) << L" Move-Wallblock guide range Z" << guideFirst << L" count " << count << L" is missing or incomplete";
+                            AddValidationIssueLine(invalidZoneReferences, issue.str());
+                        }
+                        for (int i = 0; i < count; ++i)
+                        {
+                            const int guideIndex = guideFirst + i;
+                            if (!IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, guideIndex))
+                            {
+                                continue;
+                            }
+                            const auto& guide = g_app.document.zones[static_cast<size_t>(guideIndex)];
+                            const bool neutral = guide.a == 0 && guide.b == 0 && guide.na == 0 && guide.nb == 0 &&
+                                guide.ln == 0 && guide.sc == 0 && guide.ev == 0 &&
+                                std::all_of(guide.textures.begin(), guide.textures.end(), [](uint8_t t) { return t == 0; });
+                            if (!neutral)
+                            {
+                                AddSortedUniqueInt(nonNeutralMoveGuides, guideIndex);
+                            }
+                        }
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+
+        MapValidationReportSections sections;
+
+        {
+            std::wstringstream ss;
+            ss << (g_app.gameProfile.IsKnown() ? L"[OK] " : L"[INFO] ")
+               << L"Game Profile: " << g_app.gameProfile.title << L"\r\n";
+            if (!g_app.gameProfile.rootPath.empty())
+            {
+                ss << L"Game Root: " << Utf8ToWide(g_app.gameProfile.rootPath) << L"\r\n";
+                const std::string mapFolderPath = JoinPath(g_app.gameProfile.rootPath, g_app.gameProfile.mapFolder);
+                const std::string objectFolderPath = JoinPath(g_app.gameProfile.rootPath, g_app.gameProfile.objectFolder);
+                const std::string imageFolderPath = JoinPath(g_app.gameProfile.rootPath, g_app.gameProfile.imageFolder);
+                const std::string soundFolderPath = JoinPath(g_app.gameProfile.rootPath, g_app.gameProfile.soundFolder);
+                const std::string scriptFullPath = JoinPath(g_app.gameProfile.rootPath, g_app.gameProfile.scriptPath);
+                ss << (DirectoryExistsLocal(mapFolderPath) ? L"[OK] " : L"[INFO] ") << L"Map folder: " << Utf8ToWide(g_app.gameProfile.mapFolder) << L"\r\n";
+                ss << (DirectoryExistsLocal(objectFolderPath) ? L"[OK] " : L"[INFO] ") << L"Object folder: " << Utf8ToWide(g_app.gameProfile.objectFolder) << L"\r\n";
+                ss << (DirectoryExistsLocal(imageFolderPath) ? L"[OK] " : L"[INFO] ") << L"Image folder: " << Utf8ToWide(g_app.gameProfile.imageFolder) << L"\r\n";
+                ss << (DirectoryExistsLocal(soundFolderPath) ? L"[OK] " : L"[INFO] ") << L"Sound/music folder: " << Utf8ToWide(g_app.gameProfile.soundFolder) << L"\r\n";
+                ss << (FileExistsLocal(scriptFullPath) ? L"[OK] " : L"[INFO] ") << L"Campaign script: " << Utf8ToWide(g_app.gameProfile.scriptPath) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[INFO] Game Root: not detected from current map path\r\n";
+            }
+            sections.profile = ss.str();
+        }
+
+        {
+            std::wstringstream ss;
+            ss << L"Zones: " << g_app.document.zones.size() << L" total, " << wallCount << L" walls, "
+               << triggerCount << L" event triggers, " << monsterLineCount << L" object/marker lines, "
+               << levelEndCount << L" level exits\r\n";
+            ss << L"Player 1 start: " << FormatYesNo(hasP1Start) << L"\r\n";
+            ss << L"Player 2 start: " << FormatYesNo(hasP2Start) << L"\r\n";
+            ss << L"Exit line: " << FormatYesNo(levelEndCount > 0) << L"\r\n";
+            ss << L"Commands: " << addObjectCount << L" AddMonster/Object, "
+               << openDoorCount << L" OpenDoor, " << changeTextureCount << L" ChangeTexture, "
+               << teleportCount << L" Teleport, " << loadObjectsCount << L" LoadObjects, "
+               << rotatePolyCount << L" RotatePoly\r\n";
+            ss << L"Move Wallblock commands: " << moveWallBlockCount << L"\r\n";
+            ss << L"Object types used: " << FormatObjectTypeList(objectTypes) << L"\r\n";
+            if (!usedTextures.empty())
+            {
+                ss << L"Texture IDs used: " << usedTextures.size() << L" unique, min " << usedTextures.front()
+                   << L", max " << usedTextures.back() << L"\r\n";
+            }
+            else
+            {
+                ss << L"Texture IDs used: none\r\n";
+            }
+            ss << L"Unsupported/raw events: " << unsupportedEventCount << L"\r\n";
+            sections.intelligence = ss.str();
+        }
+
+        {
+            std::wstringstream ss;
+            ss << (hasP1Start ? L"[OK] " : L"[WARN] ") << L"Player 1 start object in Event 1\r\n";
+            ss << (levelEndCount > 0 ? L"[OK] " : L"[WARN] ") << L"Level exit line present\r\n";
+            ss << (loadObjectsCount > 0 ? L"[OK] " : L"[INFO] ") << L"LoadObjects command count: " << loadObjectsCount << L"\r\n";
+            if (eventOneTriggerCount > 0)
+            {
+                ss << (g_app.gameProfile.kind == GameProfileKind::ZombieMassacre ? L"[INFO] " : L"[WARN] ")
+                   << L"Event 1 is used by " << eventOneTriggerCount << L" trigger line(s). Original Zombie Massacre maps may do this; classic Gloom maps usually keep Event 1 for map-start/object loading.\r\n";
+            }
+            else
+            {
+                ss << L"[OK] Event 1 is not used as a normal trigger source\r\n";
+            }
+            if (!triggerlessEvents.empty())
+            {
+                ss << L"[WARN] Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[OK] No triggered event slot with commands is orphaned\r\n";
+            }
+            if (!emptyTriggeredEvents.empty())
+            {
+                ss << L"[INFO] Trigger line(s) point to empty event slot(s): " << FormatObjectTypeList(emptyTriggeredEvents) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[OK] No trigger line points to an empty event slot\r\n";
+            }
+            if (!invalidTriggerEventZones.empty())
+            {
+                ss << L"[WARN] Trigger/helper line(s) use invalid Event IDs: " << FormatObjectTypeList(invalidTriggerEventZones) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[OK] Trigger line Event IDs are within the valid 1-24 range\r\n";
+            }
+            if (!invalidZoneReferences.empty())
+            {
+                ss << L"[WARN] Event command(s) reference missing or incomplete zone ranges: " << FormatLimitedWideList(invalidZoneReferences) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[OK] Event command zone references point into the map zone list\r\n";
+            }
+            if (!objectOutsideMapIssues.empty())
+            {
+                ss << L"[WARN] Object/player spawn(s) are outside the current map bounds: " << FormatLimitedWideList(objectOutsideMapIssues) << L"\r\n";
+            }
+            else
+            {
+                ss << L"[OK] Object/player spawn positions are within the current map bounds\r\n";
+            }
+            if (textureOutOfCorpusCount > 0)
+            {
+                ss << L"[INFO] " << textureOutOfCorpusCount << L" texture slot reference(s) use IDs outside the shipped 0-79 corpus range. Keep this for custom texture sets.\r\n";
+            }
+            if (unusualScCount > 0)
+            {
+                ss << L"[INFO] " << unusualScCount << L" wall(s) use unusual texture scale values outside the common corpus range.\r\n";
+            }
+            if (!nonNeutralMoveGuides.empty())
+            {
+                ss << L"[WARN] Move-Wallblock target guide zone(s) are not AI/collision-neutral: " << FormatObjectTypeList(nonNeutralMoveGuides) << L"\r\n";
+                sections.safeNeutralGuideZones = nonNeutralMoveGuides;
+            }
+            else if (moveWallBlockCount > 0)
+            {
+                ss << L"[OK] Move-Wallblock guide zones look AI/collision-neutral\r\n";
+            }
+            sections.checks = ss.str();
+        }
+
+        {
+            std::wstringstream ss;
+            bool wroteSuggestion = false;
+            auto addSuggestion = [&](const wchar_t* severity, const std::wstring& text)
+            {
+                ss << severity << L" " << text << L"\r\n";
+                wroteSuggestion = true;
+            };
+
+            if (!hasP1Start)
+            {
+                addSuggestion(L"[WARN]", L"Add Player 1 start with the left toolbar button 'Set Player Start'. The start should be written into Event 1.");
+            }
+            if (levelEndCount <= 0)
+            {
+                addSuggestion(L"[WARN]", L"Add a level exit line with 'Set Level End'. Without it, the map may not be finishable.");
+            }
+            if (loadObjectsCount <= 0)
+            {
+                addSuggestion(L"[INFO]", L"No LoadObjects command found. Original maps often load object/sprite resources from Event 1; check Events if enemies/items should appear.");
+            }
+            if (eventOneTriggerCount > 0)
+            {
+                if (g_app.gameProfile.kind == GameProfileKind::ZombieMassacre)
+                {
+                    addSuggestion(L"[INFO]", L"Event 1 trigger usage can be valid for Zombie Massacre. Keep it if the map was imported from that game.");
+                }
+                else
+                {
+                    addSuggestion(L"[WARN]", L"Classic Gloom maps usually reserve Event 1 for init/player/object loading. Move normal trigger logic to Event 2 or higher if this was accidental.");
+                }
+            }
+            if (!triggerlessEvents.empty())
+            {
+                std::wstringstream line;
+                line << L"Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents) << L". Add trigger lines or intentionally move one-shot setup commands to Event 1.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            if (!emptyTriggeredEvents.empty())
+            {
+                std::wstringstream line;
+                line << L"Trigger line(s) point to empty event slot(s): " << FormatObjectTypeList(emptyTriggeredEvents) << L". Link a target action or delete/change those trigger assignments.";
+                addSuggestion(L"[INFO]", line.str());
+            }
+            if (!invalidTriggerEventZones.empty())
+            {
+                std::wstringstream line;
+                line << L"Trigger/helper line(s) with invalid Event IDs: " << FormatObjectTypeList(invalidTriggerEventZones) << L". Edit those zones and use Event 1-24, or 0 for an inert helper line.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            if (!invalidZoneReferences.empty())
+            {
+                std::wstringstream line;
+                line << L"Event commands reference missing zones/ranges: " << FormatLimitedWideList(invalidZoneReferences, 5) << L". Re-link the affected event actions or remove the broken commands in Map > Events.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            if (!objectOutsideMapIssues.empty())
+            {
+                std::wstringstream line;
+                line << L"Object/player spawn positions outside the current map bounds: " << FormatLimitedWideList(objectOutsideMapIssues, 5) << L". Move them with drag-and-drop or reset Player Start.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            if (textureOutOfCorpusCount > 0)
+            {
+                std::wstringstream line;
+                line << textureOutOfCorpusCount << L" texture reference(s) are outside the shipped 0-79 corpus range. This is fine for custom texture sets; otherwise reassign visible wall bands.";
+                addSuggestion(L"[INFO]", line.str());
+            }
+            if (unusualScCount > 0)
+            {
+                std::wstringstream line;
+                line << unusualScCount << L" wall(s) use unusual texture scale values. Check them visually; keep them if they intentionally create narrow-face texture mapping.";
+                addSuggestion(L"[INFO]", line.str());
+            }
+            if (!nonNeutralMoveGuides.empty())
+            {
+                std::wstringstream line;
+                line << L"Move-Wallblock guide zone(s) " << FormatObjectTypeList(nonNeutralMoveGuides) << L" can be repaired safely: 'Apply Safe Fixes' will make them invisible and AI/collision-neutral.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+
+            if (!wroteSuggestion)
+            {
+                ss << L"[OK] No actionable improvement suggestions found.\r\n";
+            }
+            sections.suggestions = ss.str();
+        }
+
+        {
+            std::wstringstream ss;
+            const auto issues = g_app.document.Validate();
+            if (issues.empty())
+            {
+                ss << L"[OK] MapFormat validation returned no technical issues.\r\n";
+            }
+            else
+            {
+                for (const auto& item : issues)
+                {
+                    if (item == "No issues found." || item == "No issues found")
+                    {
+                        continue;
+                    }
+                    const bool autoRecalculatedOnSave = item.find("will be recalculated on save") != std::string::npos;
+                    ss << (autoRecalculatedOnSave ? L"[INFO] " : L"[WARN] ") << Utf8ToWide(item) << L"\r\n";
+                }
+            }
+            sections.technical = ss.str();
+        }
+
+        sections.okCount = CountValidationTagOccurrences(sections.profile, L"[OK]") +
+            CountValidationTagOccurrences(sections.checks, L"[OK]") +
+            CountValidationTagOccurrences(sections.technical, L"[OK]");
+        sections.infoCount = CountValidationTagOccurrences(sections.profile, L"[INFO]") +
+            CountValidationTagOccurrences(sections.checks, L"[INFO]") +
+            CountValidationTagOccurrences(sections.technical, L"[INFO]");
+        sections.warnCount = CountValidationTagOccurrences(sections.profile, L"[WARN]") +
+            CountValidationTagOccurrences(sections.checks, L"[WARN]") +
+            CountValidationTagOccurrences(sections.technical, L"[WARN]");
+        sections.saveWarnCount = CountValidationTagOccurrences(sections.checks, L"[WARN]") +
+            CountValidationTagOccurrences(sections.technical, L"[WARN]");
+
+        std::wstringstream full;
+        full << L"Game Profile\r\n" << sections.profile << L"\r\n";
+        full << L"Map Intelligence\r\n" << sections.intelligence << L"\r\n";
+        full << L"Corpus Checks / Warnings\r\n" << sections.checks << L"\r\n";
+        full << L"Suggested Fixes\r\n" << sections.suggestions << L"\r\n";
+        full << L"Technical Validation\r\n" << sections.technical;
+        sections.full = full.str();
+        return sections;
+    }
+
+    std::wstring BuildMapValidationReport()
+    {
+        return BuildMapValidationReportSections().full;
+    }
+
+    bool CopyTextToClipboard(HWND owner, const std::wstring& text)
+    {
+        if (!OpenClipboard(owner)) return false;
+        EmptyClipboard();
+
+        const SIZE_T bytes = (text.size() + 1u) * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!memory)
+        {
+            CloseClipboard();
+            return false;
+        }
+
+        void* target = GlobalLock(memory);
+        if (!target)
+        {
+            GlobalFree(memory);
+            CloseClipboard();
+            return false;
+        }
+        std::memcpy(target, text.c_str(), bytes);
+        GlobalUnlock(memory);
+
+        if (!SetClipboardData(CF_UNICODETEXT, memory))
+        {
+            GlobalFree(memory);
+            CloseClipboard();
+            return false;
+        }
+
+        CloseClipboard();
+        return true;
+    }
+
+    constexpr int kValidationCopyAllControlId = 0x7F01;
+    constexpr int kValidationApplySafeFixesControlId = 0x7F02;
+
+    struct ValidationDialogState
+    {
+        MapValidationReportSections sections;
+        HFONT titleFont = nullptr;
+        HFONT sectionFont = nullptr;
+        HFONT monoFont = nullptr;
+        HWND profileEdit = nullptr;
+        HWND intelligenceEdit = nullptr;
+        HWND checksEdit = nullptr;
+        HWND suggestionsEdit = nullptr;
+        HWND technicalEdit = nullptr;
+        HWND repairButton = nullptr;
+        HWND copyButton = nullptr;
+        HWND closeButton = nullptr;
+    };
+
+    bool EnsureRichEditLoaded()
+    {
+        static bool attempted = false;
+        static HMODULE module = nullptr;
+        if (!attempted)
+        {
+            attempted = true;
+            module = LoadLibraryW(L"Msftedit.dll");
+        }
+        return module != nullptr;
+    }
+
+    bool IsRichEditWindow(HWND hwnd)
+    {
+        wchar_t className[80]{};
+        if (!hwnd || !GetClassNameW(hwnd, className, static_cast<int>(sizeof(className) / sizeof(className[0]))))
+        {
+            return false;
+        }
+        return wcsstr(className, L"RichEdit") != nullptr || wcscmp(className, MSFTEDIT_CLASS) == 0;
+    }
+
+    struct ValidationStatusTagStyle
+    {
+        const wchar_t* tag;
+        COLORREF color;
+    };
+
+    void ApplyValidationTagColor(HWND edit, const wchar_t* tag, COLORREF color)
+    {
+        if (!edit || !tag || !*tag)
+        {
+            return;
+        }
+
+        CHARRANGE searchRange{0, -1};
+        FINDTEXTEXW find{};
+        find.lpstrText = const_cast<wchar_t*>(tag);
+
+        while (true)
+        {
+            find.chrg = searchRange;
+            const LRESULT found = SendMessageW(edit, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&find));
+            if (found < 0)
+            {
+                break;
+            }
+
+            SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&find.chrgText));
+            CHARFORMAT2W format{};
+            format.cbSize = sizeof(format);
+            format.dwMask = CFM_COLOR;
+            format.crTextColor = color;
+            SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+
+            if (find.chrgText.cpMax <= searchRange.cpMin)
+            {
+                break;
+            }
+            searchRange.cpMin = find.chrgText.cpMax;
+            searchRange.cpMax = -1;
+        }
+    }
+
+    void ApplyValidationRichTextColors(HWND edit, const std::wstring& /*text*/)
+    {
+        if (!IsRichEditWindow(edit))
+        {
+            return;
+        }
+
+        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(edit, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(kDarkFieldBg));
+
+        CHARRANGE allRange{0, -1};
+        SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&allRange));
+        CHARFORMAT2W baseFormat{};
+        baseFormat.cbSize = sizeof(baseFormat);
+        baseFormat.dwMask = CFM_COLOR;
+        baseFormat.crTextColor = kDarkListText;
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&baseFormat));
+
+        const ValidationStatusTagStyle tagStyles[] =
+        {
+            { L"[OK]", kValidationOkText },
+            { L"[INFO]", kValidationInfoText },
+            { L"[WARN]", kValidationWarnText },
+        };
+
+        for (const ValidationStatusTagStyle& style : tagStyles)
+        {
+            ApplyValidationTagColor(edit, style.tag, style.color);
+        }
+
+        CHARRANGE caretRange{0, 0};
+        SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&caretRange));
+        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(edit, nullptr, TRUE);
+    }
+
+    void SetValidationBlockText(HWND edit, const std::wstring& text)
+    {
+        if (!edit) return;
+        SetWindowTextW(edit, text.c_str());
+        ApplyValidationRichTextColors(edit, text);
+    }
+
+    HWND CreateValidationBlock(HWND parent, const std::wstring& text, HFONT font)
+    {
+        const wchar_t* className = EnsureRichEditLoaded() ? MSFTEDIT_CLASS : L"EDIT";
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, className, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL | WS_VSCROLL,
+            0, 0, 10, 10, parent, nullptr, g_app.instance, nullptr);
+        if (edit)
+        {
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+            SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(8, 8));
+            SetValidationBlockText(edit, text);
+        }
+        return edit;
+    }
+
+    void SetValidationChildFont(HWND child, HFONT font)
+    {
+        if (child)
+        {
+            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))), TRUE);
+        }
+    }
+
+    void UpdateValidationRepairButton(ValidationDialogState* state)
+    {
+        if (!state || !state->repairButton) return;
+        EnableWindow(state->repairButton, state->sections.HasSafeRepairs() ? TRUE : FALSE);
+        SetWindowTextW(state->repairButton, state->sections.HasSafeRepairs() ? L"Apply Safe Fixes" : L"No Safe Fixes");
+    }
+
+    bool ApplySafeValidationRepairsNoPrompt(const MapValidationReportSections& sections, bool pushUndoSnapshot)
+    {
+        if (!sections.HasSafeRepairs())
+        {
+            return false;
+        }
+
+        if (pushUndoSnapshot)
+        {
+            PushUndoSnapshot();
+        }
+
+        int fixedCount = 0;
+        for (int zoneIndex : sections.safeNeutralGuideZones)
+        {
+            if (zoneIndex >= 0 && zoneIndex < static_cast<int>(g_app.document.zones.size()))
+            {
+                MakeMoveWallGroupGuideAiNeutral(g_app.document.zones[zoneIndex]);
+                ++fixedCount;
+            }
+        }
+
+        if (fixedCount <= 0)
+        {
+            return false;
+        }
+
+        MarkDirty();
+        RefreshPreviewImage();
+        RefreshZoneList();
+        RefreshStatus();
+        UpdateModeButtons();
+        InvalidateEditorViews();
+        return true;
+    }
+
+    std::vector<std::wstring> CollectSaveValidationWarningLines(const MapValidationReportSections& sections)
+    {
+        std::vector<std::wstring> warnings;
+        auto collect = [&](const std::wstring& block)
+        {
+            std::wstringstream input(block);
+            std::wstring line;
+            while (std::getline(input, line))
+            {
+                while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) line.pop_back();
+                if (line.find(L"[WARN]") != std::wstring::npos &&
+                    line.find(L"No issues found") == std::wstring::npos)
+                {
+                    warnings.push_back(line);
+                }
+            }
+        };
+        collect(sections.checks);
+        collect(sections.technical);
+        return warnings;
+    }
+
+    std::wstring BuildSaveValidationWarningSummary(const MapValidationReportSections& sections)
+    {
+        const std::vector<std::wstring> warnings = CollectSaveValidationWarningLines(sections);
+        if (warnings.empty())
+        {
+            return L"No save-blocking validation issues found.";
+        }
+
+        std::wstringstream ss;
+        const size_t shown = MinValue<size_t>(warnings.size(), 7u);
+        for (size_t i = 0; i < shown; ++i)
+        {
+            ss << L"- " << warnings[i] << L"\n";
+        }
+        if (warnings.size() > shown)
+        {
+            ss << L"- ... +" << (warnings.size() - shown) << L" more warning(s)\n";
+        }
+        if (sections.HasSafeRepairs())
+        {
+            ss << L"\nSafe fixes available: Move-Wallblock target guides will be made invisible and AI/collision-neutral.";
+        }
+        else
+        {
+            ss << L"\nNo clearly safe automatic fixes are available. Please review the Validate Map window.";
+        }
+        return ss.str();
+    }
+
+    enum class SaveValidationAction
+    {
+        Cancel,
+        SaveAnyway,
+        SaveWithSafeFixes,
+    };
+
+    constexpr int kSaveValidationSaveFixesControlId = 0x7F11;
+    constexpr int kSaveValidationSaveAnywayControlId = 0x7F12;
+    constexpr int kSaveValidationCancelControlId = 0x7F13;
+
+    struct SaveValidationDialogState
+    {
+        const MapValidationReportSections* sections = nullptr;
+        std::wstring bodyText;
+        SaveValidationAction action = SaveValidationAction::Cancel;
+        HFONT titleFont = nullptr;
+        HFONT monoFont = nullptr;
+        HWND bodyEdit = nullptr;
+        HWND fixButton = nullptr;
+        HWND saveAnywayButton = nullptr;
+        HWND cancelButton = nullptr;
+    };
+
+    void SetSaveValidationDialogActionAndClose(HWND hwnd, SaveValidationDialogState* state, SaveValidationAction action)
+    {
+        if (state)
+        {
+            state->action = action;
+        }
+        DestroyWindow(hwnd);
+    }
+
+    LRESULT CALLBACK SaveValidationWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        auto* state = reinterpret_cast<SaveValidationDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        switch (msg)
+        {
+        case WM_NCCREATE:
+            {
+                auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+                return TRUE;
+            }
+
+        case WM_CREATE:
+            {
+                state = reinterpret_cast<SaveValidationDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                if (!state || !state->sections)
+                {
+                    return -1;
+                }
+
+                HFONT defaultFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                {
+                    LOGFONTW titleLf{};
+                    if (defaultFont)
+                    {
+                        GetObjectW(defaultFont, sizeof(titleLf), &titleLf);
+                    }
+                    titleLf.lfHeight = -18;
+                    titleLf.lfWeight = FW_SEMIBOLD;
+                    wcscpy_s(titleLf.lfFaceName, L"Segoe UI");
+                    state->titleFont = CreateFontIndirectW(&titleLf);
+                }
+                state->monoFont = CreateFontW(
+                    -13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                    FIXED_PITCH | FF_MODERN, L"Consolas");
+
+                HWND icon = CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_ICON,
+                    22, 22, 42, 42, hwnd, nullptr, g_app.instance, nullptr);
+                if (icon)
+                {
+                    HICON appIcon = LoadIconW(nullptr, IDI_WARNING);
+                    SendMessageW(icon, STM_SETICON, reinterpret_cast<WPARAM>(appIcon), 0);
+                }
+
+                HWND title = CreateWindowW(L"STATIC", L"Validate before Save",
+                    WS_CHILD | WS_VISIBLE,
+                    82, 20, 500, 26, hwnd, nullptr, g_app.instance, nullptr);
+                HWND subtitle = CreateWindowW(L"STATIC", L"The map has warnings. Please choose how it should be saved.",
+                    WS_CHILD | WS_VISIBLE,
+                    82, 50, 560, 20, hwnd, nullptr, g_app.instance, nullptr);
+
+                CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                    22, 84, 626, 2, hwnd, nullptr, g_app.instance, nullptr);
+
+                state->bodyEdit = CreateValidationBlock(hwnd, state->bodyText, state->monoFont ? state->monoFont : defaultFont);
+                MoveWindow(state->bodyEdit, 22, 102, 626, 190, TRUE);
+
+                CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                    22, 310, 626, 2, hwnd, nullptr, g_app.instance, nullptr);
+
+                const bool hasSafeRepairs = state->sections->HasSafeRepairs();
+                state->fixButton = CreateWindowW(L"BUTTON", hasSafeRepairs ? L"Save with Fixes" : L"No Safe Fixes",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    22, 328, 202, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveValidationSaveFixesControlId)), g_app.instance, nullptr);
+                state->saveAnywayButton = CreateWindowW(L"BUTTON", L"Save Anyway",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    238, 328, 176, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveValidationSaveAnywayControlId)), g_app.instance, nullptr);
+                state->cancelButton = CreateWindowW(L"BUTTON", L"Cancel",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    526, 328, 122, 30, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSaveValidationCancelControlId)), g_app.instance, nullptr);
+
+                SetValidationChildFont(title, state->titleFont ? state->titleFont : defaultFont);
+                SetValidationChildFont(subtitle, defaultFont);
+                SetValidationChildFont(state->fixButton, defaultFont);
+                SetValidationChildFont(state->saveAnywayButton, defaultFont);
+                SetValidationChildFont(state->cancelButton, defaultFont);
+
+                EnableWindow(state->fixButton, hasSafeRepairs ? TRUE : FALSE);
+                ApplyEditorDarkModeToWindowTree(hwnd);
+                SetFocus(hasSafeRepairs ? state->fixButton : state->saveAnywayButton);
+                return 0;
+            }
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam))
+            {
+            case kSaveValidationSaveFixesControlId:
+                if (state && state->sections && state->sections->HasSafeRepairs())
+                {
+                    SetSaveValidationDialogActionAndClose(hwnd, state, SaveValidationAction::SaveWithSafeFixes);
+                }
+                return 0;
+            case kSaveValidationSaveAnywayControlId:
+                SetSaveValidationDialogActionAndClose(hwnd, state, SaveValidationAction::SaveAnyway);
+                return 0;
+            case kSaveValidationCancelControlId:
+            case IDCANCEL:
+            case IDOK:
+                SetSaveValidationDialogActionAndClose(hwnd, state, SaveValidationAction::Cancel);
+                return 0;
+            }
+            break;
+
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE)
+            {
+                SetSaveValidationDialogActionAndClose(hwnd, state, SaveValidationAction::Cancel);
+                return 0;
+            }
+            break;
+
+        case WM_DRAWITEM:
+            return DrawDarkOwnerDrawControl(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)) ? TRUE : 0;
+
+        case WM_CTLCOLORSTATIC:
+            if (state && reinterpret_cast<HWND>(lParam) == state->bodyEdit)
+            {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                SetBkMode(dc, OPAQUE);
+                SetBkColor(dc, kDarkFieldBg);
+                SetTextColor(dc, kDarkListText);
+                return reinterpret_cast<LRESULT>(DarkFieldBrush());
+            }
+            return HandleDarkCtlColor(msg, wParam);
+
+        case WM_CTLCOLORDLG:
+        case WM_CTLCOLORBTN:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+            return HandleDarkCtlColor(msg, wParam);
+
+        case WM_CLOSE:
+            SetSaveValidationDialogActionAndClose(hwnd, state, SaveValidationAction::Cancel);
+            return 0;
+
+        case WM_DESTROY:
+            if (state)
+            {
+                if (state->titleFont)
+                {
+                    DeleteObject(state->titleFont);
+                    state->titleFont = nullptr;
+                }
+                if (state->monoFont)
+                {
+                    DeleteObject(state->monoFont);
+                    state->monoFont = nullptr;
+                }
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return 0;
+        }
+
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    SaveValidationAction AskSaveValidationAction(const MapValidationReportSections& sections)
+    {
+        SaveValidationDialogState state{};
+        state.sections = &sections;
+        state.bodyText = L"Validate Map reports " + std::to_wstring(sections.saveWarnCount) +
+            L" save warning(s).\r\n\r\n" + BuildSaveValidationWarningSummary(sections);
+
+        const wchar_t* className = L"ZGloomEditorSaveValidationWindow";
+        static bool registered = false;
+        if (!registered)
+        {
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = SaveValidationWndProc;
+            wc.hInstance = g_app.instance;
+            wc.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = DarkWindowBrush();
+            wc.lpszClassName = className;
+            RegisterClassW(&wc);
+            registered = true;
+        }
+
+        RECT ownerRect{};
+        GetWindowRect(g_app.mainWindow, &ownerRect);
+        const int width = 690;
+        const int height = 410;
+        const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
+        const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
+
+        HWND dialog = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+            className,
+            L"Validate before Save",
+            WS_CAPTION | WS_SYSMENU | WS_POPUP,
+            x, y, width, height,
+            g_app.mainWindow, nullptr, g_app.instance, &state);
+        if (!dialog)
+        {
+            std::wstringstream fallback;
+            fallback << L"Validate Map reports " << sections.saveWarnCount << L" save warning(s).\n\n"
+                     << BuildSaveValidationWarningSummary(sections) << L"\n\n";
+            if (sections.HasSafeRepairs())
+            {
+                fallback << L"Yes = Save with Fixes\n"
+                         << L"No = Save Anyway\n"
+                         << L"Cancel = Do Not Save";
+                const int result = MessageBoxW(g_app.mainWindow, fallback.str().c_str(), L"Validate before Save", MB_YESNOCANCEL | MB_ICONWARNING);
+                if (result == IDYES) return SaveValidationAction::SaveWithSafeFixes;
+                if (result == IDNO) return SaveValidationAction::SaveAnyway;
+                return SaveValidationAction::Cancel;
+            }
+
+            fallback << L"Yes = Save Anyway\n"
+                     << L"No = Do Not Save";
+            return MessageBoxW(g_app.mainWindow, fallback.str().c_str(), L"Validate before Save", MB_YESNO | MB_ICONWARNING) == IDYES
+                ? SaveValidationAction::SaveAnyway
+                : SaveValidationAction::Cancel;
+        }
+
+        ApplyEditorDarkModeToWindowTree(dialog);
+        EnableWindow(g_app.mainWindow, FALSE);
+        ShowWindow(dialog, SW_SHOW);
+        UpdateWindow(dialog);
+
+        MSG msg{};
+        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+        {
+            if (!IsDialogMessageW(dialog, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        EnableWindow(g_app.mainWindow, TRUE);
+        SetForegroundWindow(g_app.mainWindow);
+        return state.action;
+    }
+
+
+    bool ConfirmSaveWithValidationAndMaybeFixes(const std::string& /*path*/)
+    {
+        if (!HasMapContentForValidation())
+        {
+            return true;
+        }
+
+        MapValidationReportSections sections = BuildMapValidationReportSections();
+        if (!sections.HasSaveWarnings())
+        {
+            return true;
+        }
+
+        const SaveValidationAction action = AskSaveValidationAction(sections);
+        if (action == SaveValidationAction::Cancel)
+        {
+            return false;
+        }
+        if (action == SaveValidationAction::SaveWithSafeFixes)
+        {
+            ApplySafeValidationRepairsNoPrompt(sections, true);
+        }
+        return true;
+    }
+
+    bool ApplySafeValidationRepairs(HWND owner, ValidationDialogState* state)
+    {
+        if (!state || !state->sections.HasSafeRepairs())
+        {
+            return false;
+        }
+
+        std::wstringstream question;
+        question << L"Apply safe repairs now?\n\n"
+                 << L"This will make these Move-Wallblock target guide zones invisible and AI/collision-neutral:\n"
+                 << FormatObjectTypeList(state->sections.safeNeutralGuideZones)
+                 << L"\n\nOther warnings will only stay as suggestions because they need a design decision.";
+        if (MessageBoxW(owner, question.str().c_str(), L"Validate Map", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        {
+            return false;
+        }
+
+        return ApplySafeValidationRepairsNoPrompt(state->sections, true);
+    }
+
+    void RefreshValidationDialogBlocks(ValidationDialogState* state)
+    {
+        if (!state) return;
+        SetValidationBlockText(state->profileEdit, state->sections.profile);
+        SetValidationBlockText(state->intelligenceEdit, state->sections.intelligence);
+        SetValidationBlockText(state->checksEdit, state->sections.checks);
+        SetValidationBlockText(state->suggestionsEdit, state->sections.suggestions);
+        SetValidationBlockText(state->technicalEdit, state->sections.technical);
+        UpdateValidationRepairButton(state);
+    }
+
+    LRESULT CALLBACK ValidationWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        auto* state = reinterpret_cast<ValidationDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        switch (msg)
+        {
+        case WM_NCCREATE:
+            {
+                auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+                return TRUE;
+            }
+
+        case WM_CREATE:
+            {
+                state = reinterpret_cast<ValidationDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                if (!state) return -1;
+
+                EnableEditorDarkModeForWindow(hwnd);
+                HFONT defaultFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+                LOGFONTW lf{};
+                if (defaultFont && GetObjectW(defaultFont, sizeof(lf), &lf) == sizeof(lf))
+                {
+                    LOGFONTW titleLf = lf;
+                    titleLf.lfWeight = FW_SEMIBOLD;
+                    titleLf.lfHeight = lf.lfHeight != 0 ? lf.lfHeight - 3 : -16;
+                    state->titleFont = CreateFontIndirectW(&titleLf);
+
+                    LOGFONTW sectionLf = lf;
+                    sectionLf.lfWeight = FW_SEMIBOLD;
+                    sectionLf.lfHeight = lf.lfHeight != 0 ? lf.lfHeight - 2 : -15;
+                    state->sectionFont = CreateFontIndirectW(&sectionLf);
+
+                    LOGFONTW monoLf = lf;
+                    monoLf.lfWeight = FW_NORMAL;
+                    wcscpy_s(monoLf.lfFaceName, L"Consolas");
+                    state->monoFont = CreateFontIndirectW(&monoLf);
+                }
+
+                HWND icon = CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_ICON,
+                    22, 18, 48, 48, hwnd, nullptr, g_app.instance, nullptr);
+                HICON appIcon = static_cast<HICON>(LoadImageW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 48, 48, LR_DEFAULTCOLOR));
+                if (!appIcon)
+                {
+                    appIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+                }
+                SendMessageW(icon, STM_SETICON, reinterpret_cast<WPARAM>(appIcon), 0);
+
+                HWND title = CreateWindowW(L"STATIC", L"Validate Map",
+                    WS_CHILD | WS_VISIBLE,
+                    86, 20, 700, 24, hwnd, nullptr, g_app.instance, nullptr);
+                HWND subtitle = CreateWindowW(L"STATIC", L"Map intelligence, corpus checks and technical validation",
+                    WS_CHILD | WS_VISIBLE,
+                    86, 48, 700, 20, hwnd, nullptr, g_app.instance, nullptr);
+
+                CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                    22, 84, 830, 2, hwnd, nullptr, g_app.instance, nullptr);
+
+                HWND profileHeading = CreateWindowW(L"STATIC", L"Game Profile",
+                    WS_CHILD | WS_VISIBLE,
+                    22, 102, 830, 22, hwnd, nullptr, g_app.instance, nullptr);
+                state->profileEdit = CreateValidationBlock(hwnd, state->sections.profile, state->monoFont ? state->monoFont : defaultFont);
+
+                HWND intelligenceHeading = CreateWindowW(L"STATIC", L"Map Intelligence",
+                    WS_CHILD | WS_VISIBLE,
+                    22, 194, 830, 22, hwnd, nullptr, g_app.instance, nullptr);
+                state->intelligenceEdit = CreateValidationBlock(hwnd, state->sections.intelligence, state->monoFont ? state->monoFont : defaultFont);
+
+                HWND checksHeading = CreateWindowW(L"STATIC", L"Corpus Checks / Warnings",
+                    WS_CHILD | WS_VISIBLE,
+                    22, 342, 830, 22, hwnd, nullptr, g_app.instance, nullptr);
+                state->checksEdit = CreateValidationBlock(hwnd, state->sections.checks, state->monoFont ? state->monoFont : defaultFont);
+
+                HWND suggestionsHeading = CreateWindowW(L"STATIC", L"Suggested Fixes",
+                    WS_CHILD | WS_VISIBLE,
+                    22, 496, 830, 22, hwnd, nullptr, g_app.instance, nullptr);
+                state->suggestionsEdit = CreateValidationBlock(hwnd, state->sections.suggestions, state->monoFont ? state->monoFont : defaultFont);
+
+                HWND techHeading = CreateWindowW(L"STATIC", L"Technical Validation",
+                    WS_CHILD | WS_VISIBLE,
+                    22, 626, 830, 22, hwnd, nullptr, g_app.instance, nullptr);
+                state->technicalEdit = CreateValidationBlock(hwnd, state->sections.technical, state->monoFont ? state->monoFont : defaultFont);
+
+                CreateWindowW(L"STATIC", nullptr,
+                    WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                    22, 722, 830, 2, hwnd, nullptr, g_app.instance, nullptr);
+
+                state->repairButton = CreateWindowW(L"BUTTON", state->sections.HasSafeRepairs() ? L"Apply Safe Fixes" : L"No Safe Fixes",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    446, 740, 150, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kValidationApplySafeFixesControlId)), g_app.instance, nullptr);
+                state->copyButton = CreateWindowW(L"BUTTON", L"Copy All",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    610, 740, 104, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kValidationCopyAllControlId)), g_app.instance, nullptr);
+                state->closeButton = CreateWindowW(L"BUTTON", L"OK",
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    728, 740, 124, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+
+                SetValidationChildFont(title, state->titleFont ? state->titleFont : defaultFont);
+                SetValidationChildFont(subtitle, defaultFont);
+                SetValidationChildFont(profileHeading, state->sectionFont ? state->sectionFont : defaultFont);
+                SetValidationChildFont(intelligenceHeading, state->sectionFont ? state->sectionFont : defaultFont);
+                SetValidationChildFont(checksHeading, state->sectionFont ? state->sectionFont : defaultFont);
+                SetValidationChildFont(suggestionsHeading, state->sectionFont ? state->sectionFont : defaultFont);
+                SetValidationChildFont(techHeading, state->sectionFont ? state->sectionFont : defaultFont);
+                SetValidationChildFont(state->repairButton, defaultFont);
+                SetValidationChildFont(state->copyButton, defaultFont);
+                SetValidationChildFont(state->closeButton, defaultFont);
+
+                MoveWindow(state->profileEdit, 22, 128, 830, 52, TRUE);
+                MoveWindow(state->intelligenceEdit, 22, 220, 830, 108, TRUE);
+                MoveWindow(state->checksEdit, 22, 368, 830, 114, TRUE);
+                MoveWindow(state->suggestionsEdit, 22, 522, 830, 90, TRUE);
+                MoveWindow(state->technicalEdit, 22, 652, 830, 58, TRUE);
+
+                ApplyEditorDarkModeToWindowTree(hwnd);
+                UpdateValidationRepairButton(state);
+                SetFocus(state->closeButton);
+                return 0;
+            }
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
+            {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kValidationApplySafeFixesControlId)
+            {
+                if (state && ApplySafeValidationRepairs(hwnd, state))
+                {
+                    state->sections = BuildMapValidationReportSections();
+                    RefreshValidationDialogBlocks(state);
+                    SetWindowTextW(state->repairButton, L"Fixed");
+                    UpdateValidationRepairButton(state);
+                }
+                return 0;
+            }
+            if (LOWORD(wParam) == kValidationCopyAllControlId)
+            {
+                if (state && CopyTextToClipboard(hwnd, state->sections.full))
+                {
+                    SetWindowTextW(state->copyButton, L"Copied");
+                }
+                else
+                {
+                    MessageBoxW(hwnd, L"Could not copy the validation report to the clipboard.", L"Validate Map", MB_OK | MB_ICONWARNING);
+                }
+                return 0;
+            }
+            break;
+
+        case WM_DRAWITEM:
+            return DrawDarkOwnerDrawControl(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)) ? TRUE : 0;
+
+        case WM_CTLCOLORSTATIC:
+            if (state)
+            {
+                HWND child = reinterpret_cast<HWND>(lParam);
+                if (child == state->profileEdit || child == state->intelligenceEdit ||
+                    child == state->checksEdit || child == state->suggestionsEdit || child == state->technicalEdit)
+                {
+                    HDC dc = reinterpret_cast<HDC>(wParam);
+                    SetBkMode(dc, OPAQUE);
+                    SetBkColor(dc, kDarkFieldBg);
+                    SetTextColor(dc, kDarkListText);
+                    return reinterpret_cast<LRESULT>(DarkFieldBrush());
+                }
+            }
+            return HandleDarkCtlColor(msg, wParam);
+
+        case WM_CTLCOLORDLG:
+        case WM_CTLCOLORBTN:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+            return HandleDarkCtlColor(msg, wParam);
+
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            if (state)
+            {
+                if (state->titleFont) DeleteObject(state->titleFont);
+                if (state->sectionFont) DeleteObject(state->sectionFont);
+                if (state->monoFont) DeleteObject(state->monoFont);
+                delete state;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return 0;
+        }
+
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
     void ShowValidationReport()
     {
-        const auto issues = g_app.document.Validate();
-        std::wstringstream ss;
-        for (const auto& item : issues)
+        auto* state = new ValidationDialogState();
+        state->sections = BuildMapValidationReportSections();
+
+        const wchar_t* className = L"ZGloomEditorValidationWindow";
+        static bool registered = false;
+        if (!registered)
         {
-            ss << Utf8ToWide(item) << L"\r\n";
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = ValidationWndProc;
+            wc.hInstance = g_app.instance;
+            wc.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = DarkWindowBrush();
+            wc.lpszClassName = className;
+            RegisterClassW(&wc);
+            registered = true;
         }
-        MessageBoxW(g_app.mainWindow, ss.str().c_str(), L"Validation", MB_OK | MB_ICONINFORMATION);
+
+        RECT ownerRect{};
+        GetWindowRect(g_app.mainWindow, &ownerRect);
+        const int width = 890;
+        const int height = 820;
+        const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
+        const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
+
+        HWND dialog = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE,
+            className,
+            L"Validate Map",
+            WS_CAPTION | WS_SYSMENU | WS_POPUP,
+            x, y, width, height,
+            g_app.mainWindow, nullptr, g_app.instance, state);
+        if (!dialog)
+        {
+            const std::wstring fallback = state->sections.full;
+            delete state;
+            MessageBoxW(g_app.mainWindow, fallback.c_str(), L"Validate Map", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        ApplyEditorDarkModeToWindowTree(dialog);
+        EnableWindow(g_app.mainWindow, FALSE);
+        ShowWindow(dialog, SW_SHOW);
+        UpdateWindow(dialog);
+
+        MSG msg{};
+        while (IsWindow(dialog) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+        {
+            if (!IsDialogMessageW(dialog, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        EnableWindow(g_app.mainWindow, TRUE);
+        SetForegroundWindow(g_app.mainWindow);
     }
 
     void ApplyGreyMenuBackground(HMENU menu)
@@ -10104,6 +13494,11 @@ namespace
             drawLine(accent, r.left, cy, r.left + 4, cy);
             drawLine(accent, r.right, cy, r.right - 4, cy);
             break;
+        case kCmdViewEventGraphOverlay:
+            drawLine(accent2, r.left + 1, cy, r.right - 1, cy);
+            drawLine(accent2, r.left + 4, r.top + 3, cx, cy);
+            drawLine(accent2, cx, cy, r.right - 4, r.bottom - 3);
+            break;
         case IDM_HELP_ABOUT:
             drawRect(accent, RGB(32, 42, 52), r);
             SetBkMode(hdc, TRANSPARENT);
@@ -10187,6 +13582,16 @@ namespace
 
             RECT iconRc{ rc.left + 8, rc.top + 5, rc.left + 24, rc.bottom - 5 };
             DrawMenuCommandIcon(hdc, iconRc, item->id, disabled);
+            if (item->id == kCmdViewEventGraphOverlay && g_app.showEventGraphOverlay)
+            {
+                HPEN checkPen = CreatePen(PS_SOLID, 2, RGB(92, 214, 132));
+                HPEN oldCheckPen = reinterpret_cast<HPEN>(SelectObject(hdc, checkPen));
+                MoveToEx(hdc, iconRc.left + 1, iconRc.bottom - 5, nullptr);
+                LineTo(hdc, iconRc.left + 6, iconRc.bottom - 1);
+                LineTo(hdc, iconRc.right - 1, iconRc.top + 2);
+                if (oldCheckPen) SelectObject(hdc, oldCheckPen);
+                DeleteObject(checkPen);
+            }
 
             textRc.left += 46;
             textRc.right -= 14;
@@ -10237,6 +13642,7 @@ namespace
         HMENU menuBar = CreateMenu();
         HMENU fileMenu = CreatePopupMenu();
         HMENU editMenu = CreatePopupMenu();
+        HMENU viewMenu = CreatePopupMenu();
         HMENU aboutMenu = CreatePopupMenu();
 
         AppendOwnerDrawMenuItem(fileMenu, IDM_FILE_NEW, L"&New");
@@ -10254,6 +13660,8 @@ namespace
         AppendOwnerDrawMenuItem(fileMenu, IDM_FILE_SAVE_AS, L"Save &As...");
         AppendOwnerDrawMenuItem(fileMenu, IDM_FILE_EXPORT_SVG, L"Export &SVG Overview...");
         AppendOwnerDrawSeparator(fileMenu);
+        AppendOwnerDrawMenuItem(fileMenu, IDM_TOOLS_SETTINGS, L"Editor &Settings");
+        AppendOwnerDrawSeparator(fileMenu);
         AppendOwnerDrawMenuItem(fileMenu, IDM_FILE_EXIT, L"E&xit");
 
         AppendOwnerDrawMenuItem(editMenu, IDM_EDIT_UNDO, L"&Undo\tCtrl+Z");
@@ -10265,10 +13673,13 @@ namespace
         AppendOwnerDrawMenuItem(editMenu, kCmdLinkEnemyObjects, L"Link Event -> &Enemy/Objects");
         AppendOwnerDrawMenuItem(editMenu, IDM_EDIT_LINK_ROTATE_CW, L"Link Event -> Rotate &CW");
         AppendOwnerDrawMenuItem(editMenu, IDM_EDIT_LINK_ROTATE_CCW, L"Link Event -> Rotate &CCW");
+        AppendOwnerDrawMenuItem(editMenu, kCmdLinkMoveWallGroup, L"Link Event -> Move Wall&block");
         AppendOwnerDrawMenuItem(editMenu, IDM_EDIT_SET_TELEPORT_TARGET, L"Set &Teleport Target");
         AppendOwnerDrawSeparator(editMenu);
         AppendOwnerDrawMenuItem(editMenu, IDM_TOOLS_VALIDATE, L"&Validate Map");
-        AppendOwnerDrawMenuItem(editMenu, IDM_TOOLS_SETTINGS, L"Editor &Settings...");
+
+        AppendOwnerDrawMenuItem(viewMenu, IDM_MAP_EVENTS, L"Show &Events");
+        AppendOwnerDrawMenuItem(viewMenu, kCmdViewEventGraphOverlay, L"Toggle Event &Links Overlay");
 
         AppendOwnerDrawMenuItem(aboutMenu, IDM_HELP_ABOUT, L"&Information");
 
@@ -10276,12 +13687,14 @@ namespace
         UpdateRecentFilesMenu();
         ApplyDarkMenuHints(fileMenu);
         ApplyDarkMenuHints(editMenu);
+        ApplyDarkMenuHints(viewMenu);
         ApplyDarkMenuHints(aboutMenu);
 
         // Keep the top-level menu bar native so item widths stay Windows-like.
         // Only the drop-down menus are owner-drawn in the Visual-Studio-like dark style.
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"&File");
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(editMenu), L"&Edit");
+        AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(viewMenu), L"&View");
         AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(aboutMenu), L"&About");
         return menuBar;
     }
@@ -10324,57 +13737,253 @@ namespace
         hideControl(g_app.btnFlipDoorDirection);
         hideControl(g_app.btnAddMonster);
 
-        int y = contentTop + padding;
-        const int x = padding;
+        hideControl(g_app.btnTextures);
+        hideControl(g_app.btnEvents);
+        hideControl(g_app.btnAddWall);
+        hideControl(g_app.btnAddTrigger);
+        hideControl(g_app.btnLinkEvent);
+        hideControl(g_app.btnLinkSwitchTexture);
+        hideControl(g_app.btnLinkEnemyObjects);
+        hideControl(g_app.btnLinkRotateCW);
+        hideControl(g_app.btnLinkRotateCCW);
+        hideControl(g_app.btnLinkMoveWallGroup);
+        hideControl(g_app.btnDeleteLinkEvent);
+        hideControl(g_app.btnPlaceEnemy);
+        hideControl(g_app.btnPlacePickup);
+        hideControl(g_app.btnPlaceWeapon);
+        hideControl(g_app.btnPlayerStart);
+        hideControl(g_app.btnSetTeleportTarget);
+        hideControl(g_app.btnLevelEnd);
+        hideControl(g_app.btnValidateMap);
+        hideControl(g_app.btnToolbarScrollUp);
+        hideControl(g_app.btnToolbarScrollDown);
+        hideControl(g_app.lineValidateTop);
+        hideControl(g_app.lineZonesLeft);
+        hideControl(g_app.labelZones);
+        hideControl(g_app.lineZonesRight);
+        hideControl(g_app.lineObjectsLeft);
+        hideControl(g_app.labelObjects);
+        hideControl(g_app.lineObjectsRight);
+        hideControl(g_app.lineEventLinksLeft);
+        hideControl(g_app.labelEventLinks);
+        hideControl(g_app.lineEventLinksRight);
+        hideControl(g_app.lineOrderLeft);
+        hideControl(g_app.labelOrder);
+        hideControl(g_app.lineOrderRight);
+        hideControl(g_app.lineMapMarkersLeft);
+        hideControl(g_app.labelMapMarkers);
+        hideControl(g_app.lineMapMarkersRight);
+
         const int buttonWidth = MaxValue(120, leftWidth - (padding * 2));
-        const int groupWidth = buttonWidth;
-        const int labelWidth = MaxValue(96, MinValue(150, groupWidth - 20));
-        const int labelX = x + (groupWidth - labelWidth) / 2;
+        // v45: center the left toolbar controls in the full left rail, including
+        // the visual gap before the canvas.  Previously they sat flush at the
+        // left padding, which made the whole button column look slightly off.
+        const int leftRailWidth = rightAreaX;
+        const int x = MaxValue(padding, (leftRailWidth - buttonWidth) / 2);
 
-        auto moveGroupHeader = [&](HWND leftLine, HWND label, HWND rightLine)
+        auto measureToolbarHeight = [&]() -> int
         {
-            if (leftLine) ShowWindow(leftLine, SW_HIDE);
-            if (rightLine) ShowWindow(rightLine, SW_HIDE);
-            MoveWindow(label, x, y, buttonWidth, groupHeaderHeight, TRUE);
-            ShowWindow(label, SW_SHOW);
-            y += groupHeaderHeight + groupHeaderGap;
+            int h = 0;
+            auto addGroup = [&]() { h += groupHeaderHeight + groupHeaderGap; };
+            auto addButton = [&]() { h += buttonHeight + 7; };
+            auto addGap = [&]() { h += groupGap - 4; };
+
+            addGroup();
+            addButton();
+            addButton();
+            addGap();
+
+            addGroup();
+            addButton();
+            addButton();
+            addGap();
+
+            addGroup();
+            addButton();
+            addButton();
+            addButton();
+            addButton();
+            addButton();
+            addButton();
+            addButton();
+            addGap();
+
+            addGroup();
+            addButton();
+            addButton();
+            addButton();
+            addGap();
+
+            addGroup();
+            addButton();
+            addButton();
+            addButton();
+
+            addGap();
+            h += 13; // separator and small breathing room before Validate Map
+            addButton();
+            return MaxValue(0, h - 7);
         };
-        auto moveButton = [&](HWND button)
+
+        const int toolbarTotalHeight = measureToolbarHeight();
+        const int normalAvailableHeight = MaxValue(1, contentHeight - padding * 2);
+        const bool useToolbarScroll = toolbarTotalHeight > normalAvailableHeight;
+        g_app.toolbarScrollMode = useToolbarScroll;
+
+        if (!useToolbarScroll)
         {
-            MoveWindow(button, x, y, buttonWidth, buttonHeight, TRUE);
-            ShowWindow(button, SW_SHOW);
-            y += buttonHeight + 7;
-        };
+            g_app.toolbarScrollY = 0;
+            g_app.toolbarScrollMaxY = 0;
 
-        moveGroupHeader(g_app.lineZonesLeft, g_app.labelZones, g_app.lineZonesRight);
-        moveButton(g_app.btnTextures);
-        moveButton(g_app.btnEvents);
-        y += groupGap - 4;
+            int y = contentTop + padding;
+            auto moveGroupHeader = [&](HWND leftLine, HWND label, HWND rightLine)
+            {
+                if (leftLine) ShowWindow(leftLine, SW_HIDE);
+                if (rightLine) ShowWindow(rightLine, SW_HIDE);
+                MoveWindow(label, x, y, buttonWidth, groupHeaderHeight, TRUE);
+                ShowWindow(label, SW_SHOW);
+                y += groupHeaderHeight + groupHeaderGap;
+            };
+            auto moveButton = [&](HWND button)
+            {
+                MoveWindow(button, x, y, buttonWidth, buttonHeight, TRUE);
+                ShowWindow(button, SW_SHOW);
+                y += buttonHeight + 7;
+            };
 
-        moveGroupHeader(g_app.lineObjectsLeft, g_app.labelObjects, g_app.lineObjectsRight);
-        moveButton(g_app.btnAddWall);
-        moveButton(g_app.btnAddTrigger);
-        y += groupGap - 4;
+            moveGroupHeader(g_app.lineZonesLeft, g_app.labelZones, g_app.lineZonesRight);
+            moveButton(g_app.btnTextures);
+            moveButton(g_app.btnEvents);
+            y += groupGap - 4;
 
-        moveGroupHeader(g_app.lineEventLinksLeft, g_app.labelEventLinks, g_app.lineEventLinksRight);
-        moveButton(g_app.btnLinkEvent);
-        moveButton(g_app.btnLinkSwitchTexture);
-        moveButton(g_app.btnLinkEnemyObjects);
-        moveButton(g_app.btnLinkRotateCW);
-        moveButton(g_app.btnLinkRotateCCW);
-        moveButton(g_app.btnDeleteLinkEvent);
-        y += groupGap - 4;
+            moveGroupHeader(g_app.lineObjectsLeft, g_app.labelObjects, g_app.lineObjectsRight);
+            moveButton(g_app.btnAddWall);
+            moveButton(g_app.btnAddTrigger);
+            y += groupGap - 4;
 
-        moveGroupHeader(g_app.lineOrderLeft, g_app.labelOrder, g_app.lineOrderRight);
-        moveButton(g_app.btnPlaceEnemy);
-        moveButton(g_app.btnPlacePickup);
-        moveButton(g_app.btnPlaceWeapon);
-        y += groupGap - 4;
+            moveGroupHeader(g_app.lineEventLinksLeft, g_app.labelEventLinks, g_app.lineEventLinksRight);
+            moveButton(g_app.btnLinkEvent);
+            moveButton(g_app.btnLinkSwitchTexture);
+            moveButton(g_app.btnLinkEnemyObjects);
+            moveButton(g_app.btnLinkRotateCW);
+            moveButton(g_app.btnLinkRotateCCW);
+            moveButton(g_app.btnLinkMoveWallGroup);
+            moveButton(g_app.btnDeleteLinkEvent);
+            y += groupGap - 4;
 
-        moveGroupHeader(g_app.lineMapMarkersLeft, g_app.labelMapMarkers, g_app.lineMapMarkersRight);
-        moveButton(g_app.btnPlayerStart);
-        moveButton(g_app.btnSetTeleportTarget);
-        moveButton(g_app.btnLevelEnd);
+            moveGroupHeader(g_app.lineOrderLeft, g_app.labelOrder, g_app.lineOrderRight);
+            moveButton(g_app.btnPlaceEnemy);
+            moveButton(g_app.btnPlacePickup);
+            moveButton(g_app.btnPlaceWeapon);
+            y += groupGap - 4;
+
+            moveGroupHeader(g_app.lineMapMarkersLeft, g_app.labelMapMarkers, g_app.lineMapMarkersRight);
+            moveButton(g_app.btnPlayerStart);
+            moveButton(g_app.btnSetTeleportTarget);
+            moveButton(g_app.btnLevelEnd);
+
+            const int validateY = contentTop + contentHeight - padding - buttonHeight;
+            if (validateY > y + 8)
+            {
+                if (g_app.lineValidateTop)
+                {
+                    MoveWindow(g_app.lineValidateTop, x, validateY - 13, buttonWidth, 1, TRUE);
+                    ShowWindow(g_app.lineValidateTop, SW_SHOW);
+                }
+                MoveWindow(g_app.btnValidateMap, x, validateY, buttonWidth, buttonHeight, TRUE);
+                ShowWindow(g_app.btnValidateMap, SW_SHOW);
+            }
+            else
+            {
+                y += groupGap - 4;
+                moveButton(g_app.btnValidateMap);
+            }
+        }
+        else
+        {
+            const int scrollButtonHeight = 24;
+            const int scrollButtonGap = 6;
+            const int scrollTop = contentTop + padding;
+            const int scrollBottom = contentTop + contentHeight - padding;
+            const int visibleTop = scrollTop + scrollButtonHeight + scrollButtonGap;
+            const int visibleBottom = MaxValue(visibleTop + 1, scrollBottom - scrollButtonHeight - scrollButtonGap);
+            const int visibleHeight = MaxValue(1, visibleBottom - visibleTop);
+            g_app.toolbarScrollMaxY = MaxValue(0, toolbarTotalHeight - visibleHeight);
+            g_app.toolbarScrollY = ClampValue(g_app.toolbarScrollY, 0, g_app.toolbarScrollMaxY);
+
+            MoveWindow(g_app.btnToolbarScrollUp, x, scrollTop, buttonWidth, scrollButtonHeight, TRUE);
+            MoveWindow(g_app.btnToolbarScrollDown, x, scrollBottom - scrollButtonHeight, buttonWidth, scrollButtonHeight, TRUE);
+            ShowWindow(g_app.btnToolbarScrollUp, SW_SHOW);
+            ShowWindow(g_app.btnToolbarScrollDown, SW_SHOW);
+            EnableWindow(g_app.btnToolbarScrollUp, g_app.toolbarScrollY > 0 ? TRUE : FALSE);
+            EnableWindow(g_app.btnToolbarScrollDown, g_app.toolbarScrollY < g_app.toolbarScrollMaxY ? TRUE : FALSE);
+
+            int y = visibleTop - g_app.toolbarScrollY;
+            auto showIfFullyVisible = [&](HWND control, int itemY, int itemH)
+            {
+                if (!control) return;
+                MoveWindow(control, x, itemY, buttonWidth, itemH, TRUE);
+                const bool visible = itemY >= visibleTop && (itemY + itemH) <= visibleBottom;
+                ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+            };
+            auto moveGroupHeader = [&](HWND leftLine, HWND label, HWND rightLine)
+            {
+                if (leftLine) ShowWindow(leftLine, SW_HIDE);
+                if (rightLine) ShowWindow(rightLine, SW_HIDE);
+                showIfFullyVisible(label, y, groupHeaderHeight);
+                y += groupHeaderHeight + groupHeaderGap;
+            };
+            auto moveButton = [&](HWND button)
+            {
+                showIfFullyVisible(button, y, buttonHeight);
+                y += buttonHeight + 7;
+            };
+            auto moveSeparator = [&]()
+            {
+                if (g_app.lineValidateTop)
+                {
+                    MoveWindow(g_app.lineValidateTop, x, y + 6, buttonWidth, 1, TRUE);
+                    const bool visible = (y + 6) >= visibleTop && (y + 7) <= visibleBottom;
+                    ShowWindow(g_app.lineValidateTop, visible ? SW_SHOW : SW_HIDE);
+                }
+                y += 13;
+            };
+
+            moveGroupHeader(g_app.lineZonesLeft, g_app.labelZones, g_app.lineZonesRight);
+            moveButton(g_app.btnTextures);
+            moveButton(g_app.btnEvents);
+            y += groupGap - 4;
+
+            moveGroupHeader(g_app.lineObjectsLeft, g_app.labelObjects, g_app.lineObjectsRight);
+            moveButton(g_app.btnAddWall);
+            moveButton(g_app.btnAddTrigger);
+            y += groupGap - 4;
+
+            moveGroupHeader(g_app.lineEventLinksLeft, g_app.labelEventLinks, g_app.lineEventLinksRight);
+            moveButton(g_app.btnLinkEvent);
+            moveButton(g_app.btnLinkSwitchTexture);
+            moveButton(g_app.btnLinkEnemyObjects);
+            moveButton(g_app.btnLinkRotateCW);
+            moveButton(g_app.btnLinkRotateCCW);
+            moveButton(g_app.btnLinkMoveWallGroup);
+            moveButton(g_app.btnDeleteLinkEvent);
+            y += groupGap - 4;
+
+            moveGroupHeader(g_app.lineOrderLeft, g_app.labelOrder, g_app.lineOrderRight);
+            moveButton(g_app.btnPlaceEnemy);
+            moveButton(g_app.btnPlacePickup);
+            moveButton(g_app.btnPlaceWeapon);
+            y += groupGap - 4;
+
+            moveGroupHeader(g_app.lineMapMarkersLeft, g_app.labelMapMarkers, g_app.lineMapMarkersRight);
+            moveButton(g_app.btnPlayerStart);
+            moveButton(g_app.btnSetTeleportTarget);
+            moveButton(g_app.btnLevelEnd);
+
+            y += groupGap - 4;
+            moveSeparator();
+            moveButton(g_app.btnValidateMap);
+        }
 
         MoveWindow(g_app.canvas, rightAreaX, contentTop + padding, canvasWidth, panelHeight, TRUE);
         MoveWindow(g_app.infoPanel, rightAreaX + canvasWidth + padding, contentTop + padding, MaxValue(180, actualInfoWidth - padding), panelHeight, TRUE);
@@ -10382,6 +13991,10 @@ namespace
         UpdateInfoPanelScrollBar(g_app.infoPanel);
         InvalidateRect(hwnd, nullptr, TRUE);
         InvalidateEditorViews();
+        if (g_app.statusBar)
+        {
+            RedrawWindow(g_app.statusBar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+        }
     }
 
     void UpdateCanvasScrollBars(HWND hwnd)
@@ -11214,6 +14827,11 @@ namespace
             {
                 InitializeNewWallTextureSequence(zone);
                 UpdateWallTextureBandCountFromLength(zone);
+                // Keep the live Draw Wall mapping authoritative for both the
+                // 2D rubber-band line and the 3D Walk Preview. Classification
+                // from zone.sc is ambiguous for freshly-built preview zones
+                // (especially 2/8 Clip), so re-apply the active picker mode last.
+                ApplyWallTextureModeToZone(zone, g_app.activeWallTextureMode);
             }
         }
         else
@@ -11546,6 +15164,10 @@ namespace
             return L"Link Event > Rotate CW: click the first wall of the rotating group. Connected walls are detected automatically.";
         case InsertMode::LinkEventToRotateCounterClockwise:
             return L"Link Event > Rotate CCW: click the first wall of the rotating group. Connected walls are detected automatically.";
+        case InsertMode::LinkEventToMoveWallGroup:
+            return g_app.pendingMoveWallGroupSourceZone >= 0
+                ? L"Move Wallblock: move the copied block with the mouse, then click the target position."
+                : L"Move Wallblock: click one wall segment of the block that should move.";
         case InsertMode::SetTeleportTarget:
             if (g_app.teleportTargetAwaitDirection)
             {
@@ -11594,19 +15216,47 @@ namespace
         return L"Select a wall, trigger, object or teleport target, or choose a drawing/link tool on the left.";
     }
 
-    void DrawCanvasHelpOverlay(HDC hdc, const RECT& rc)
+    void DrawCanvasTextOverlayBox(HDC hdc, const RECT& rc, const std::wstring& text, bool bottomLeft)
     {
-        const std::wstring text = GetCanvasHelpText();
-        if (text.empty())
+        if (text.empty() || rc.right - rc.left < 120 || rc.bottom - rc.top < 80)
         {
             return;
         }
 
-        RECT box{ 18, 18, MinValue(rc.right - 18, 540), 76 };
-        RECT measure{ box.left + 10, box.top + 8, box.right - 10, rc.bottom - 18 };
+        constexpr int margin = 18;
+        constexpr int padX = 10;
+        constexpr int padY = 8;
+
+        const int left = rc.left + margin;
+        const int maxRight = rc.right - margin;
+        if (maxRight <= left + 80)
+        {
+            return;
+        }
+
+        SIZE oneLine{};
+        GetTextExtentPoint32W(hdc, text.c_str(), static_cast<int>(text.size()), &oneLine);
+
+        // Prefer one line and only wrap when the canvas is too narrow.
+        int wantedRight = MinValue(maxRight, left + padX + oneLine.cx + padX);
+        if (wantedRight < left + 120)
+        {
+            wantedRight = maxRight;
+        }
+
+        RECT measure{ left + padX, 0, wantedRight - padX, rc.bottom };
         DrawTextW(hdc, text.c_str(), -1, &measure, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
-        box.bottom = MinValue(rc.bottom - 18, measure.bottom + 8);
-        box.right = MinValue(rc.right - 18, MaxValue(box.right, measure.right + 10));
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(hdc, &tm);
+        const int lineHeight = MaxValue(16, tm.tmHeight + tm.tmExternalLeading);
+        const int maxTextHeight = lineHeight * 2 + 2;
+        const int textHeight = MinValue(maxTextHeight, MaxValue(lineHeight, measure.bottom - measure.top));
+        const int boxHeight = textHeight + padY * 2;
+        const int top = bottomLeft
+            ? MaxValue(rc.top + margin, rc.bottom - margin - boxHeight)
+            : rc.top + margin;
+        RECT box{ left, top, wantedRight, MinValue(rc.bottom - margin, top + boxHeight) };
 
         HBRUSH bg = CreateSolidBrush(RGB(22, 22, 26));
         FillRect(hdc, &box, bg);
@@ -11620,9 +15270,21 @@ namespace
         SelectObject(hdc, oldPen);
         DeleteObject(border);
 
-        RECT textRc{ box.left + 10, box.top + 8, box.right - 10, box.bottom - 8 };
+        RECT textRc{ box.left + padX, box.top + padY, box.right - padX, box.bottom - padY };
         SetTextColor(hdc, kDarkMutedText);
         DrawTextW(hdc, text.c_str(), -1, &textRc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+
+    void DrawCanvasHelpOverlay(HDC hdc, const RECT& rc)
+    {
+        DrawCanvasTextOverlayBox(hdc, rc, GetCanvasHelpText(), false);
+    }
+
+    void DrawCanvasQuickHelpOverlay(HDC hdc, const RECT& rc)
+    {
+        DrawCanvasTextOverlayBox(hdc, rc,
+            L"ESC ends current task | SPACE + Left Mouse drags the map | Right Mouse places 3D viewpoint on map",
+            true);
     }
 
     void PaintCanvas(HWND hwnd)
@@ -11729,7 +15391,9 @@ namespace
 
             if (zone.ztype == static_cast<int>(mapfmt::ZoneType::Wall))
             {
-                HPEN pen = CreatePen(PS_SOLID, selected ? 4 : 2, selected ? RGB(255, 220, 64) : RGB(96, 170, 255));
+                const bool moveGuideWall = (zone.a == 0 && zone.b == 0);
+                HPEN pen = CreatePen(moveGuideWall ? PS_DOT : PS_SOLID, selected ? 4 : 2,
+                    selected ? RGB(255, 220, 64) : (moveGuideWall ? RGB(115, 135, 160) : RGB(96, 170, 255)));
                 HPEN prev = static_cast<HPEN>(SelectObject(hdc, pen));
                 MoveToEx(hdc, p1.x, p1.y, nullptr);
                 LineTo(hdc, p2.x, p2.y);
@@ -11806,6 +15470,10 @@ namespace
 
             if (zone.ztype == static_cast<int>(mapfmt::ZoneType::Wall))
             {
+                if (zone.a == 0 && zone.b == 0 && !selected)
+                {
+                    skipZoneLabel = true;
+                }
                 const int reversePair = FindReverseWallPairIndex(i);
                 if (reversePair >= 0)
                 {
@@ -11864,6 +15532,8 @@ namespace
             }
         }
 
+        DrawAllMoveWallGroupEventPaths(hdc, rc, bounds);
+        DrawEventGraphOverlay(hdc, rc, bounds);
         DrawEventLogicOverlay(hdc, rc, bounds);
         DrawTeleportTargetOverlays(hdc, rc, bounds);
         DrawEventMonsterSpawnOverlays(hdc, rc, bounds);
@@ -11892,7 +15562,10 @@ namespace
             DeleteObject(pen);
         }
 
+        DrawMoveWallGroupPlacementPreview(hdc, rc, bounds);
+
         DrawCanvasHelpOverlay(hdc, rc);
+        DrawCanvasQuickHelpOverlay(hdc, rc);
 
         SelectObject(hdc, oldFont);
         DeleteObject(font);
@@ -12019,12 +15692,41 @@ namespace
     constexpr double kWalkPreviewFov = kWalkPreviewPi * 0.42; // ~75.6 degrees; wider than the old 60 degree tunnel view.
     constexpr double kWalkPreviewWallHeightWorld = 256.0; // one grid/wall element should project as a square.
 
+    bool ShouldShowWalkPreview(const RECT& panelRc)
+    {
+        const int leftPad = 12;
+        const int rightPad = 12;
+        const int controlHeight = 58;
+        const int top = GetPreviewScrollBarRect(panelRc).bottom + 14;
+        const int availableWidth = panelRc.right - leftPad - rightPad;
+        const int availableHeight = panelRc.bottom - top - controlHeight - 14;
+        if (availableWidth < 120 || availableHeight < 120)
+        {
+            return false;
+        }
+
+        const int size = MinValue(availableWidth, availableHeight);
+        // When the square 3D preview would shrink to two thirds or less of
+        // the inspector/overview width, hide it instead of leaving a tiny box
+        // floating below the texture overview.
+        if (size * 3 <= availableWidth * 2)
+        {
+            return false;
+        }
+        return true;
+    }
+
     RECT GetWalkPreviewRect(const RECT& panelRc)
     {
         const int leftPad = 12;
         const int rightPad = 12;
         const int controlHeight = 58;
         const int top = GetPreviewScrollBarRect(panelRc).bottom + 14;
+        if (!ShouldShowWalkPreview(panelRc))
+        {
+            return RECT{ leftPad, top, leftPad, top };
+        }
+
         const int availableWidth = MaxValue(96, panelRc.right - leftPad - rightPad);
         const int availableHeight = MaxValue(96, panelRc.bottom - top - controlHeight - 14);
         const int size = MaxValue(96, MinValue(availableWidth, availableHeight));
@@ -12034,6 +15736,10 @@ namespace
     RECT GetWalkPreviewControlsRect(const RECT& panelRc)
     {
         const RECT view = GetWalkPreviewRect(panelRc);
+        if (view.right <= view.left || view.bottom <= view.top)
+        {
+            return RECT{ view.left, view.bottom, view.left, view.bottom };
+        }
         return RECT{ view.left, view.bottom + 8, view.right, view.bottom + 58 };
     }
 
@@ -12435,6 +16141,7 @@ namespace
 
     void DrawWalkPreviewControls(HDC hdc, const RECT& panelRc)
     {
+        if (!ShouldShowWalkPreview(panelRc)) return;
         const RECT controls = GetWalkPreviewControlsRect(panelRc);
         const int gap = 5;
         const int rowH = 22;
@@ -12487,6 +16194,21 @@ namespace
         return ApplyGloomRuntimeDim(pixel, depth);
     }
 
+    bool TryBuildActiveDrawWallPreviewZone(mapfmt::Zone& outZone)
+    {
+        if (!g_app.isDrawing || g_app.insertMode != InsertMode::Wall)
+        {
+            return false;
+        }
+        if (IsTinyDrawSegment(g_app.drawStartWorld, g_app.drawCurrentWorld))
+        {
+            return false;
+        }
+
+        outZone = BuildZoneFromDrawPoints(InsertMode::Wall, g_app.drawStartWorld, g_app.drawCurrentWorld);
+        return IsWallZone(outZone);
+    }
+
     void DrawWalkPreview3D(HDC hdc, const RECT& viewRc)
     {
         EnsureWalkPreviewCamera();
@@ -12508,6 +16230,8 @@ namespace
         const int columns = w;
         const double maxDistance = 4096.0;
         std::vector<double> depth(columns, maxDistance);
+        mapfmt::Zone activeDrawWall{};
+        const bool hasActiveDrawWall = TryBuildActiveDrawWallPreviewZone(activeDrawWall);
 
         auto setPixel = [&](int x, int y, COLORREF color)
         {
@@ -12526,6 +16250,7 @@ namespace
             const double dz = forwardZ + rightZ * cameraX * halfFovTan;
             double bestT = maxDistance;
             bool hitDoor = false;
+            bool bestIsActiveDrawWall = false;
             int bestZoneIndex = -1;
             double bestU = 0.0;
             for (int zi = 0; zi < static_cast<int>(g_app.document.zones.size()); ++zi)
@@ -12537,6 +16262,7 @@ namespace
                 {
                     bestT = t;
                     hitDoor = IsZoneControlledByOpenDoor(zi);
+                    bestIsActiveDrawWall = false;
                     bestZoneIndex = zi;
                     const double hx = g_app.walkPreviewX + dx * t;
                     const double hz = g_app.walkPreviewZ + dz * t;
@@ -12546,10 +16272,28 @@ namespace
                     bestU = ClampValue(((hx - static_cast<double>(zone.x1)) * wx + (hz - static_cast<double>(zone.z1)) * wz) / lenSq, 0.0, 1.0);
                 }
             }
-            depth[c] = bestT;
-            if (bestT < maxDistance && bestZoneIndex >= 0)
+            if (hasActiveDrawWall)
             {
-                const auto& hitZone = g_app.document.zones[bestZoneIndex];
+                double t = 0.0;
+                if (RaySegmentIntersection(g_app.walkPreviewX, g_app.walkPreviewZ, dx, dz, activeDrawWall, t) && t < bestT)
+                {
+                    bestT = t;
+                    hitDoor = false;
+                    bestIsActiveDrawWall = true;
+                    bestZoneIndex = -1;
+                    const double hx = g_app.walkPreviewX + dx * t;
+                    const double hz = g_app.walkPreviewZ + dz * t;
+                    const double wx = static_cast<double>(activeDrawWall.x2 - activeDrawWall.x1);
+                    const double wz = static_cast<double>(activeDrawWall.z2 - activeDrawWall.z1);
+                    const double lenSq = MaxValue(1.0, wx * wx + wz * wz);
+                    bestU = ClampValue(((hx - static_cast<double>(activeDrawWall.x1)) * wx + (hz - static_cast<double>(activeDrawWall.z1)) * wz) / lenSq, 0.0, 1.0);
+                }
+            }
+            depth[c] = bestT;
+            if (bestT < maxDistance && (bestZoneIndex >= 0 || bestIsActiveDrawWall))
+            {
+                const auto& hitZone = bestIsActiveDrawWall ? activeDrawWall : g_app.document.zones[bestZoneIndex];
+                const int sampleZoneIndex = bestIsActiveDrawWall ? -1 : bestZoneIndex;
                 const double corrected = bestT;
                 const int wallH = ClampValue(static_cast<int>(std::lround((kWalkPreviewWallHeightWorld * projectionScale) / MaxValue(48.0, corrected))), 8, h * 4);
                 const int y1 = h / 2 - wallH / 2;
@@ -12559,7 +16303,7 @@ namespace
                 for (int y = drawTop; y < drawBottom; ++y)
                 {
                     const double v = static_cast<double>(y - y1) / MaxValue(1.0, static_cast<double>(wallH));
-                    setPixel(c, y, SampleWalkPreviewWallColor(bestZoneIndex, hitZone, bestU, v, hitDoor, bestT));
+                    setPixel(c, y, SampleWalkPreviewWallColor(sampleZoneIndex, hitZone, bestU, v, hitDoor, bestT));
                 }
             }
         }
@@ -12685,6 +16429,7 @@ namespace
     {
         RECT rc{};
         GetClientRect(hwnd, &rc);
+        if (!ShouldShowWalkPreview(rc)) return false;
         const RECT controls = GetWalkPreviewControlsRect(rc);
         const int gap = 5;
         const int rowH = 22;
@@ -12750,9 +16495,9 @@ namespace
         RECT rc{};
         GetClientRect(hwnd, &rc);
 
-        HBRUSH bg = CreateSolidBrush(RGB(31, 31, 36));
-        FillRect(hdc, &rc, bg);
-        DeleteObject(bg);
+        // v45: use the same background as the main UI so the inspector no
+        // longer appears as a separate darker panel.
+        FillRect(hdc, &rc, DarkWindowBrush());
         SetBkMode(hdc, TRANSPARENT);
 
         HFONT titleFont = CreateFontW(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
@@ -12906,7 +16651,7 @@ namespace
             }
             details << L"\r\nThis marker is an Add Monster event command, not a map zone.";
             detailText = details.str();
-            noteText = L"Use Left/Right to rotate by 5 deg. Edit exact values in Map > Events. The preview below uses the original object sprite when objs/ or char/ files are available.";
+            noteText = L"Drag this marker in the map to move it. Use Left/Right to rotate by 5 deg. Edit exact values in Map > Events. The preview below uses the original object sprite when objs/ or char/ files are available.";
             anchorNoteToPreviewBox = true;
         }
         else if (g_app.insertMode == InsertMode::ObjectSpawn)
@@ -12934,7 +16679,12 @@ namespace
             details << L"Selected: Z" << g_app.selectedZone << L"\r\n";
             details << L"Type: " << ZoneRoleToText(zone) << L"\r\n";
             details << L"Coords: (" << zone.x1 << L", " << zone.z1 << L") -> (" << zone.x2 << L", " << zone.z2 << L")\r\n";
-            details << L"Event: " << zone.ev << L"\r\n";
+            details << L"Event: " << zone.ev;
+            if (zone.ev >= 1 && zone.ev <= mapfmt::MapDocument::kEventCount)
+            {
+                details << L" (" << EventSlotRoleText(zone.ev - 1) << L")";
+            }
+            details << L"\r\n";
             const bool selectedEventTrigger = IsEventTriggerLineZone(zone);
             const bool selectedLevelEnd = IsLevelEndZone(zone);
             if (selectedLevelEnd)
@@ -12974,6 +16724,11 @@ namespace
                 {
                     details << L"\r\n" << animInfo;
                 }
+            }
+            const std::wstring validationInfo = FormatSelectedZoneValidationSummary(g_app.selectedZone);
+            if (!validationInfo.empty())
+            {
+                details << L"\r\nValidation:\r\n" << validationInfo;
             }
             detailText = details.str();
             if (IsLevelEndZone(zone))
@@ -13273,9 +17028,12 @@ namespace
             }
         }
 
-        const RECT walkPreviewRc = GetWalkPreviewRect(rc);
-        DrawWalkPreview3D(hdc, walkPreviewRc);
-        DrawWalkPreviewControls(hdc, rc);
+        if (ShouldShowWalkPreview(rc))
+        {
+            const RECT walkPreviewRc = GetWalkPreviewRect(rc);
+            DrawWalkPreview3D(hdc, walkPreviewRc);
+            DrawWalkPreviewControls(hdc, rc);
+        }
 
         SelectObject(hdc, oldFont);
         DeleteObject(titleFont);
@@ -13361,7 +17119,7 @@ namespace
         }
 
         g_app.activeWallTextureMode = newMode;
-        if (g_app.insertMode != InsertMode::Wall && IsSelectedWall())
+        if (IsSelectedWall() && !(g_app.insertMode == InsertMode::Wall && g_app.isDrawing))
         {
             NormalizeSelectedWallToCanonical();
             PushUndoSnapshot();
@@ -13386,7 +17144,7 @@ namespace
 
         auto applyToSelectedWallIfNeeded = [&]()
         {
-            if (g_app.insertMode == InsertMode::Wall || !IsSelectedWall())
+            if (!IsSelectedWall() || (g_app.insertMode == InsertMode::Wall && g_app.isDrawing))
             {
                 return false;
             }
@@ -13418,6 +17176,14 @@ namespace
             {
                 PersistActiveSwitchTextureChoiceForCurrentContext();
                 RefreshWallTexturePickerPreviewFromActive();
+            }
+            else if (g_app.insertMode == InsertMode::Wall)
+            {
+                // While Draw Wall is active, keep the live picker state instead
+                // of re-syncing from the previously selected wall. New walls use
+                // the currently visible texture/strip and mapping mode.
+                RefreshWallTexturePickerPreviewFromActive();
+                InvalidateEditorViewsIncludingWalkPreview();
             }
             else
             {
@@ -13788,6 +17554,24 @@ namespace
                 return 0;
             }
 
+            if (g_app.insertMode == InsertMode::LinkEventToMoveWallGroup)
+            {
+                SetFocus(hwnd);
+                const POINT world = ScreenToWorld(rc, g_app.document.ComputeBounds(), GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                if (g_app.pendingMoveWallGroupTargetPlacementActive)
+                {
+                    CommitMoveWallGroupTargetPlacement(world);
+                    return 0;
+                }
+
+                const int targetZone = HitTestZone(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), rc);
+                if (BeginMoveWallGroupTargetPlacement(targetZone, world))
+                {
+                    SetCapture(hwnd);
+                }
+                return 0;
+            }
+
             if (g_app.insertMode == InsertMode::SetTeleportTarget)
             {
                 SetFocus(hwnd);
@@ -13850,6 +17634,9 @@ namespace
                 ClearSelectedTeleportTarget();
                 g_app.selectedZone = -1;
                 g_app.previewTextureBand = 0;
+                BeginMonsterSpawnDrag(spawn, POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }, rc);
+                SetFocus(hwnd);
+                SetCapture(hwnd);
                 RefreshZoneList();
                 RefreshPreviewImage();
                 UpdateModeButtons();
@@ -13923,6 +17710,21 @@ namespace
                 }
                 return 0;
             }
+            if (g_app.pendingMoveWallGroupTargetPlacementActive)
+            {
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                const POINT world = ScreenToWorld(rc, g_app.document.ComputeBounds(), GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                UpdateMoveWallGroupTargetPlacement(world);
+                return 0;
+            }
+            if (g_app.monsterSpawnDragging)
+            {
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                UpdateMonsterSpawnDrag(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }, rc);
+                return 0;
+            }
             if (g_app.isPanning)
             {
                 RECT rc{};
@@ -13951,7 +17753,14 @@ namespace
                 {
                     g_app.drawCurrentWorld = PrepareLineZoneDrawEndpoint(g_app.drawCurrentWorld);
                 }
-                InvalidateRect(hwnd, nullptr, FALSE);
+                if (g_app.insertMode == InsertMode::Wall)
+                {
+                    InvalidateEditorViewsIncludingWalkPreview();
+                }
+                else
+                {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
             }
             break;
@@ -13965,6 +17774,12 @@ namespace
             }
             break;
         case WM_LBUTTONUP:
+            if (g_app.monsterSpawnDragging)
+            {
+                FinishMonsterSpawnDrag();
+                if (GetCapture() == hwnd) ReleaseCapture();
+                return 0;
+            }
             if (g_app.isPanning)
             {
                 g_app.isPanning = false;
@@ -13994,6 +17809,13 @@ namespace
         case WM_CAPTURECHANGED:
             if (reinterpret_cast<HWND>(lParam) != hwnd)
             {
+                if (g_app.pendingMoveWallGroupTargetPlacementActive)
+                {
+                    ResetPendingMoveWallGroup();
+                    UpdateModeButtons();
+                    RefreshStatus();
+                    InvalidateEditorViews();
+                }
                 if (g_app.isDrawing)
                 {
                     g_app.isDrawing = false;
@@ -14006,6 +17828,10 @@ namespace
                 {
                     g_app.isPanning = false;
                     RefreshStatus();
+                }
+                if (g_app.monsterSpawnDragging)
+                {
+                    FinishMonsterSpawnDrag();
                 }
                 if (g_app.walkPreviewRightDrag)
                 {
@@ -14095,7 +17921,7 @@ namespace
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_MOVE_UP), g_app.instance, nullptr);
         g_app.btnDown = CreateWindowW(L"BUTTON", L"Move Down", WS_CHILD | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_MOVE_DOWN), g_app.instance, nullptr);
-        g_app.btnEvents = CreateWindowW(L"BUTTON", L"Events", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        g_app.btnEvents = CreateWindowW(L"BUTTON", L"Toggle Event Links Overlay", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_EVENTS), g_app.instance, nullptr);
         g_app.btnTextures = CreateWindowW(L"BUTTON", L"Texture Slots", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_TEXTURES), g_app.instance, nullptr);
@@ -14113,12 +17939,22 @@ namespace
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_LINK_ROTATE_CW), g_app.instance, nullptr);
         g_app.btnLinkRotateCCW = CreateWindowW(L"BUTTON", L"Link Event > Rotate CCW", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_LINK_ROTATE_CCW), g_app.instance, nullptr);
+        g_app.btnLinkMoveWallGroup = CreateWindowW(L"BUTTON", L"Link Event > Move Wallblock", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmdLinkMoveWallGroup)), g_app.instance, nullptr);
         g_app.btnDeleteLinkEvent = CreateWindowW(L"BUTTON", L"Delete Link Event", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_DELETE_LINK_EVENT), g_app.instance, nullptr);
         g_app.btnSetTeleportTarget = CreateWindowW(L"BUTTON", L"Set Teleport Target", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_SET_TELEPORT_TARGET), g_app.instance, nullptr);
         g_app.btnFlipDoorDirection = CreateWindowW(L"BUTTON", L"Flip Door Direction", WS_CHILD | BS_OWNERDRAW,
             0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_FLIP_DOOR_DIRECTION), g_app.instance, nullptr);
+        g_app.btnValidateMap = CreateWindowW(L"BUTTON", L"Validate Map", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            0, 0, 100, 28, hwnd, reinterpret_cast<HMENU>(IDC_BTN_VALIDATE_MAP), g_app.instance, nullptr);
+        g_app.btnToolbarScrollUp = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
+            0, 0, 100, 24, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmdToolbarScrollUp)), g_app.instance, nullptr);
+        g_app.btnToolbarScrollDown = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
+            0, 0, 100, 24, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmdToolbarScrollDown)), g_app.instance, nullptr);
+        g_app.lineValidateTop = CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+            0, 0, 10, 2, hwnd, nullptr, g_app.instance, nullptr);
 
         auto createLine = [hwnd]() -> HWND {
             return CreateWindowW(L"STATIC", nullptr, WS_CHILD,
@@ -14483,6 +18319,7 @@ namespace
             case IDC_BTN_LINK_ROTATE_CW: StartLinkEventToRotateTool(true); return 0;
             case IDM_EDIT_LINK_ROTATE_CCW:
             case IDC_BTN_LINK_ROTATE_CCW: StartLinkEventToRotateTool(false); return 0;
+            case kCmdLinkMoveWallGroup: StartLinkEventToMoveWallGroupTool(); return 0;
             case IDC_BTN_DELETE_LINK_EVENT: StartDeleteLinkEventTool(); return 0;
             case IDM_EDIT_SET_TELEPORT_TARGET:
             case IDC_BTN_SET_TELEPORT_TARGET: StartSetTeleportTargetTool(); return 0;
@@ -14505,11 +18342,38 @@ namespace
             case IDC_BTN_PLACE_ENEMY: ShowObjectPlacementMenu(ObjectPlacementGroup::Enemy, g_app.btnPlaceEnemy); return 0;
             case IDC_BTN_PLACE_WEAPON: ShowObjectPlacementMenu(ObjectPlacementGroup::Weapon, g_app.btnPlaceWeapon); return 0;
             case IDC_BTN_PLACE_PICKUP: ShowObjectPlacementMenu(ObjectPlacementGroup::Pickup, g_app.btnPlacePickup); return 0;
-            case IDM_MAP_EVENTS:
-            case IDC_BTN_EVENTS: ShowEventEditor(); return 0;
+            case IDM_MAP_EVENTS: ShowEventEditor(); return 0;
             case IDM_MAP_TEXTURES:
             case IDC_BTN_TEXTURES: ShowTextureDialog(); return 0;
-            case IDM_TOOLS_VALIDATE: ShowValidationReport(); return 0;
+            case IDM_TOOLS_VALIDATE:
+            case IDC_BTN_VALIDATE_MAP:
+                if (!HasMapContentForValidation())
+                {
+                    MessageBoxW(hwnd, L"There is nothing on the map yet. Add at least one zone or object before validating.", L"Validate Map", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                ShowValidationReport();
+                return 0;
+            case kCmdToolbarScrollUp:
+                if (g_app.toolbarScrollMode)
+                {
+                    g_app.toolbarScrollY = ClampValue(g_app.toolbarScrollY - 48, 0, g_app.toolbarScrollMaxY);
+                    LayoutChildren(hwnd);
+                }
+                return 0;
+            case kCmdToolbarScrollDown:
+                if (g_app.toolbarScrollMode)
+                {
+                    g_app.toolbarScrollY = ClampValue(g_app.toolbarScrollY + 48, 0, g_app.toolbarScrollMaxY);
+                    LayoutChildren(hwnd);
+                }
+                return 0;
+            case kCmdViewEventGraphOverlay:
+            case IDC_BTN_EVENTS:
+                g_app.showEventGraphOverlay = !g_app.showEventGraphOverlay;
+                RefreshStatus();
+                InvalidateEditorViews();
+                return 0;
             case IDM_TOOLS_SETTINGS: ShowEditorSettingsDialog(); return 0;
             case IDM_HELP_ABOUT:
                 ShowAboutDialog(hwnd);
@@ -14543,6 +18407,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCmd)
     g_app.instance = instance;
     LoadEditorSettings();
     g_app.document.NewBlank();
+    RefreshGameProfile();
     g_app.walkPreviewInitialized = false;
     LoadRecentFiles();
 

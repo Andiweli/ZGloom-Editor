@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -43,6 +44,80 @@ namespace
         out[offset + 1] = static_cast<uint8_t>((value >> 16) & 0xFF);
         out[offset + 2] = static_cast<uint8_t>((value >> 8) & 0xFF);
         out[offset + 3] = static_cast<uint8_t>(value & 0xFF);
+    }
+
+    size_t FindEventRawEnd(const std::array<uint32_t, mapfmt::MapDocument::kEventCount>& eventPointers, size_t eventStart, size_t rawSize)
+    {
+        size_t eventEnd = rawSize;
+        for (uint32_t pointer : eventPointers)
+        {
+            const size_t candidate = static_cast<size_t>(pointer);
+            if (candidate > eventStart && candidate < eventEnd)
+            {
+                eventEnd = candidate;
+            }
+        }
+        return eventEnd;
+    }
+
+    bool ContainsUnsupportedRawEvent(const std::array<mapfmt::EventScript, mapfmt::MapDocument::kEventCount>& scripts)
+    {
+        for (const auto& script : scripts)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsMoveWallGroupGuideCommand(const mapfmt::EventCommand& command)
+    {
+        if (command.type != mapfmt::CommandType::RotatePoly)
+        {
+            return false;
+        }
+
+        const int distance = std::abs(static_cast<int>(command.params[2]));
+        const int flags = static_cast<int>(command.params[3]);
+        return distance == 384 && (flags == 1 || flags == 3);
+    }
+
+    std::vector<uint8_t> BuildMoveWallGroupGuideMask(
+        const std::array<mapfmt::EventScript, mapfmt::MapDocument::kEventCount>& scripts,
+        size_t zoneCount)
+    {
+        std::vector<uint8_t> guideMask(zoneCount, 0);
+        for (const auto& script : scripts)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+
+            for (const auto& command : script.commands)
+            {
+                if (!IsMoveWallGroupGuideCommand(command))
+                {
+                    continue;
+                }
+
+                const int first = static_cast<int>(command.params[0]);
+                const int count = std::max(1, static_cast<int>(command.params[1]));
+                const int guideFirst = first + count;
+                if (first < 0 || guideFirst < 0 || guideFirst + count > static_cast<int>(zoneCount))
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < count; ++i)
+                {
+                    guideMask[static_cast<size_t>(guideFirst + i)] = 1;
+                }
+            }
+        }
+        return guideMask;
     }
 
     bool ReadFileBinary(const std::string& path, std::vector<uint8_t>& data, std::string& errorMessage)
@@ -316,6 +391,11 @@ namespace mapfmt
                << " speed=" << params[2]
                << " flags=" << params[3];
             break;
+        case CommandType::UnknownRaw:
+            os << "Advanced/Raw MAPED command block preserved"
+               << "  opcode=" << rawOpcode
+               << " bytes=" << rawByteCount;
+            break;
         default:
             os << "Unknown";
             break;
@@ -333,6 +413,8 @@ namespace mapfmt
         for (auto& script : events)
         {
             script.commands.clear();
+            script.hasUnsupportedRaw = false;
+            script.rawBytes.clear();
         }
         animationBlock.clear();
         animations.clear();
@@ -536,14 +618,26 @@ namespace mapfmt
         for (auto& script : events)
         {
             script.commands.clear();
+            script.hasUnsupportedRaw = false;
+            script.rawBytes.clear();
         }
 
         for (int evIndex = 0; evIndex < kEventCount; ++evIndex)
         {
-            size_t pos = eventPointers[evIndex];
-            while ((pos + 2) <= raw.size())
+            auto& script = events[evIndex];
+            const size_t eventStart = static_cast<size_t>(eventPointers[evIndex]);
+            const size_t eventEnd = FindEventRawEnd(eventPointers, eventStart, raw.size());
+            if (eventStart <= raw.size() && eventEnd >= eventStart)
             {
-                const auto op = static_cast<CommandType>(static_cast<int16_t>(ReadBE16(raw.data() + pos)));
+                script.rawBytes.assign(raw.begin() + static_cast<std::ptrdiff_t>(eventStart), raw.begin() + static_cast<std::ptrdiff_t>(eventEnd));
+            }
+
+            size_t pos = eventStart;
+            while ((pos + 2) <= eventEnd)
+            {
+                const size_t commandStart = pos;
+                const int16_t rawOpcode = static_cast<int16_t>(ReadBE16(raw.data() + pos));
+                const auto op = static_cast<CommandType>(rawOpcode);
                 pos += 2;
                 if (op == CommandType::End)
                 {
@@ -556,7 +650,7 @@ namespace mapfmt
                 switch (op)
                 {
                 case CommandType::AddMonster:
-                    if ((pos + 10) > raw.size())
+                    if ((pos + 10) > eventEnd)
                     {
                         errorMessage = "Add Monster command is truncated.";
                         return false;
@@ -568,7 +662,7 @@ namespace mapfmt
                     }
                     break;
                 case CommandType::OpenDoor:
-                    if ((pos + 2) > raw.size())
+                    if ((pos + 2) > eventEnd)
                     {
                         errorMessage = "Open Door command is truncated.";
                         return false;
@@ -577,7 +671,7 @@ namespace mapfmt
                     pos += 2;
                     break;
                 case CommandType::Teleport:
-                    if ((pos + 8) > raw.size())
+                    if ((pos + 8) > eventEnd)
                     {
                         errorMessage = "Teleport command is truncated.";
                         return false;
@@ -589,7 +683,7 @@ namespace mapfmt
                     }
                     break;
                 case CommandType::LoadObjects:
-                    while ((pos + 2) <= raw.size())
+                    while ((pos + 2) <= eventEnd)
                     {
                         const int16_t value = static_cast<int16_t>(ReadBE16(raw.data() + pos));
                         pos += 2;
@@ -601,7 +695,7 @@ namespace mapfmt
                     }
                     break;
                 case CommandType::ChangeTexture:
-                    if ((pos + 4) > raw.size())
+                    if ((pos + 4) > eventEnd)
                     {
                         errorMessage = "Change Texture command is truncated.";
                         return false;
@@ -610,7 +704,7 @@ namespace mapfmt
                     cmd.params[1] = static_cast<int16_t>(ReadBE16(raw.data() + pos)); pos += 2;
                     break;
                 case CommandType::RotatePoly:
-                    if ((pos + 8) > raw.size())
+                    if ((pos + 8) > eventEnd)
                     {
                         errorMessage = "Rotate Poly command is truncated.";
                         return false;
@@ -622,11 +716,37 @@ namespace mapfmt
                     }
                     break;
                 default:
-                    errorMessage = "Unsupported event opcode encountered while loading.";
-                    return false;
+                    // Original MAPED maps can contain commands we do not safely
+                    // understand yet (for example morph/lock-style logic). Keep
+                    // the whole event byte block verbatim so loading and saving
+                    // never destroys that logic. The editor exposes it as an
+                    // advanced/raw entry and prevents high-level editing of that slot.
+                    script.commands.clear();
+                    script.hasUnsupportedRaw = true;
+                    EventCommand rawCommand;
+                    rawCommand.type = CommandType::UnknownRaw;
+                    rawCommand.rawOpcode = rawOpcode;
+                    rawCommand.rawByteCount = static_cast<uint32_t>(script.rawBytes.size());
+                    script.commands.push_back(rawCommand);
+                    pos = eventEnd;
+                    break;
+                }
+
+                if (script.hasUnsupportedRaw)
+                {
+                    break;
                 }
 
                 events[evIndex].commands.push_back(cmd);
+                if (pos <= commandStart)
+                {
+                    break;
+                }
+            }
+
+            if (!script.hasUnsupportedRaw)
+            {
+                script.rawBytes.clear();
             }
         }
 
@@ -646,6 +766,7 @@ namespace mapfmt
         std::vector<int16_t> required;
         for (const auto& script : scripts)
         {
+            if (script.hasUnsupportedRaw) continue;
             for (const auto& command : script.commands)
             {
                 if (command.type == CommandType::AddMonster)
@@ -696,6 +817,7 @@ namespace mapfmt
         std::vector<int16_t> existing;
         for (const auto& script : scripts)
         {
+            if (script.hasUnsupportedRaw) continue;
             for (const auto& command : script.commands)
             {
                 if (command.type == CommandType::LoadObjects)
@@ -707,6 +829,7 @@ namespace mapfmt
 
         for (auto& script : scripts)
         {
+            if (script.hasUnsupportedRaw) continue;
             script.commands.erase(std::remove_if(script.commands.begin(), script.commands.end(), [](const EventCommand& command)
             {
                 return command.type == CommandType::LoadObjects;
@@ -738,13 +861,40 @@ namespace mapfmt
         GridCell cells[2][kGridSize][kGridSize];
         std::vector<Zone> saveZones = zones;
         auto eventsToWrite = events;
-        NormalizeLoadObjectsForAmigaSave(eventsToWrite);
-        for (Zone& zone : saveZones)
+        if (!ContainsUnsupportedRawEvent(eventsToWrite))
         {
+            NormalizeLoadObjectsForAmigaSave(eventsToWrite);
+        }
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMask(eventsToWrite, saveZones.size());
+        for (size_t zoneIndex = 0; zoneIndex < saveZones.size(); ++zoneIndex)
+        {
+            Zone& zone = saveZones[zoneIndex];
             const bool lineZone = zone.ztype == static_cast<int16_t>(ZoneType::Wall) ||
                 zone.ztype == static_cast<int16_t>(ZoneType::MonsterZone) ||
                 zone.ztype == static_cast<int16_t>(ZoneType::EventTrigger);
-            if (lineZone &&
+            const bool moveWallGuide =
+                zoneIndex < moveWallGuideMask.size() &&
+                moveWallGuideMask[zoneIndex] != 0 &&
+                zone.ztype == static_cast<int16_t>(ZoneType::Wall);
+
+            // map1b-style move targets intentionally use a wall-shaped guide run
+            // with a=0/b=0.  It is the hidden destination polygon for RotatePoly
+            // and must not be recalculated into a visible wall during save.
+            // Force the values here too, so maps saved once with an older editor
+            // build are repaired by simply opening and saving them again.
+            if (moveWallGuide)
+            {
+                zone.a = 0;
+                zone.b = 0;
+                zone.na = 0;
+                zone.nb = 0;
+                zone.ln = 0;
+                zone.textures.fill(0);
+                zone.sc = 0;
+                zone.ev = 0;
+            }
+
+            if (lineZone && !moveWallGuide &&
                 (zone.ln <= 0 || (zone.na == 0 && zone.nb == 0) || (zone.a == 0 && zone.b == 0)))
             {
                 RecalculateWallMetadata(zone);
@@ -816,6 +966,17 @@ namespace mapfmt
 
             if (zone.ztype == static_cast<int16_t>(ZoneType::Wall))
             {
+                const bool moveWallGuide =
+                    zoneIndex < moveWallGuideMask.size() &&
+                    moveWallGuideMask[zoneIndex] != 0;
+                if (moveWallGuide)
+                {
+                    // Hidden destination guides are addressed directly by the
+                    // RotatePoly command. They should not become render/collision
+                    // grid entries of their own.
+                    continue;
+                }
+
                 // Amiga-compatible export for new/edited walls. Do not use the
                 // old broad rectangle expansion here: it can put 20+ walls into a
                 // single small-map cell, while original Amiga maps commonly keep
@@ -935,7 +1096,20 @@ namespace mapfmt
         for (int eventIndex = 0; eventIndex < kEventCount; ++eventIndex)
         {
             eventOffsets[eventIndex] = static_cast<uint32_t>(out.size());
-            const auto& commands = eventsToWrite[eventIndex].commands;
+            const auto& script = eventsToWrite[eventIndex];
+            if (script.hasUnsupportedRaw)
+            {
+                if (script.rawBytes.empty())
+                {
+                    errorMessage = "An advanced/raw event command exists but its preserved byte block is empty.";
+                    return false;
+                }
+                out.insert(out.end(), script.rawBytes.begin(), script.rawBytes.end());
+                WriteBE32At(out, 20 + (eventIndex * 4), eventOffsets[eventIndex]);
+                continue;
+            }
+
+            const auto& commands = script.commands;
             for (const auto& cmd : commands)
             {
                 WriteBE16(out, static_cast<uint16_t>(cmd.type));
@@ -990,6 +1164,7 @@ namespace mapfmt
     std::vector<std::string> MapDocument::Validate() const
     {
         std::vector<std::string> issues;
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMask(events, zones.size());
 
         for (size_t i = 0; i < zones.size(); ++i)
         {
@@ -1004,7 +1179,11 @@ namespace mapfmt
             }
             if (zone.ztype == static_cast<int16_t>(ZoneType::Wall))
             {
-                if (zone.ln <= 0 || (zone.na == 0 && zone.nb == 0) || (zone.a == 0 && zone.b == 0))
+                const bool moveWallGuide =
+                    i < moveWallGuideMask.size() &&
+                    moveWallGuideMask[i] != 0;
+                if (!moveWallGuide &&
+                    (zone.ln <= 0 || (zone.na == 0 && zone.nb == 0) || (zone.a == 0 && zone.b == 0)))
                 {
                     issues.push_back("Zone " + std::to_string(i) + " is a wall but has missing collision metadata; it will be recalculated on save.");
                 }
@@ -1020,6 +1199,12 @@ namespace mapfmt
 
         for (size_t ev = 0; ev < events.size(); ++ev)
         {
+            if (events[ev].hasUnsupportedRaw)
+            {
+                issues.push_back("Event " + std::to_string(ev + 1) + " contains advanced/raw MAPED commands and will be preserved verbatim.");
+                continue;
+            }
+
             for (size_t cmdIndex = 0; cmdIndex < events[ev].commands.size(); ++cmdIndex)
             {
                 const auto& cmd = events[ev].commands[cmdIndex];
@@ -1044,11 +1229,6 @@ namespace mapfmt
             {
                 issues.push_back("Animation texture range " + std::to_string(anim.first) + ".." + std::to_string(anim.Last()) + " is outside 0..159.");
             }
-        }
-
-        if (issues.empty())
-        {
-            issues.push_back("No issues found.");
         }
 
         return issues;

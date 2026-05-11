@@ -92,6 +92,7 @@
 #define IDC_BTN_SET_TELEPORT_TARGET      2021
 #define IDC_BTN_LINK_SWITCH_TEXTURE      2022
 #define IDC_BTN_DELETE_LINK_EVENT        2023
+#define IDC_BTN_VALIDATE_MAP             2024
 
 #define IDM_FILE_NEW                    40001
 #define IDM_FILE_OPEN                   40002

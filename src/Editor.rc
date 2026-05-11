@@ -68,14 +68,14 @@ CAPTION "Event Editor"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT       "Event slot", -1, 8, 8, 38, 10
-    COMBOBOX    IDC_EVENT_SLOT, 52, 6, 56, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    COMBOBOX    IDC_EVENT_SLOT, 52, 6, 124, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LISTBOX     IDC_EVENT_COMMANDS, 8, 24, 178, 128, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER
     PUSHBUTTON  "Add...", IDC_EVENT_ADD, 196, 24, 58, 14
     PUSHBUTTON  "Edit...", IDC_EVENT_EDIT, 196, 44, 58, 14
     PUSHBUTTON  "Delete", IDC_EVENT_DELETE, 196, 64, 58, 14
     PUSHBUTTON  "Move Up", IDC_EVENT_UP, 196, 84, 58, 14
     PUSHBUTTON  "Move Down", IDC_EVENT_DOWN, 196, 104, 58, 14
-    LTEXT       "The selected event slot is stored in zones via the Event field.", -1, 8, 158, 164, 16
+    LTEXT       "E1 is map-start/init. E2-E18 fire once. E19-E23 retrigger. E24 is level exit/retrigger.", -1, 8, 158, 184, 20
     DEFPUSHBUTTON "Close", IDOK, 198, 164, 56, 14
 END
 
