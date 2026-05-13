@@ -1,7 +1,6 @@
 # 🧱 ZGloom Editor
 
 <p align="left">
-  <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
   <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
 
