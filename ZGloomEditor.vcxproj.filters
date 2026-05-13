@@ -21,12 +21,18 @@
     <ClCompile Include="src\EditorApp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\CampaignEditor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\MapFormat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\decrunchmania.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\CampaignEditor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\MapFormat.h">
