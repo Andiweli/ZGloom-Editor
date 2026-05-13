@@ -1,7 +1,6 @@
 # 🧱 ZGloom Editor
 
 <p align="left">
-  <img alt="status" src="https://img.shields.io/badge/status-prototype-orange?style=flat" />
   <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
   <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
 
@@ -9,6 +8,15 @@
 
 **Gloom Level Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.  
 The goal is to provide a practical desktop tool for inspecting, editing and exporting map data while keeping the workflow close to the original Gloom/ZGloom structure.*  
+
+### Gloom Editor is now a fully-fledged Gloom level editor.
+
+Furthermore, a campaign editor has been added to the menu.
+
+- Select an existing installation
+- Images and textures can be exported and imported
+- The game script can be edited
+- New campaigns can be created
 
 <p align="center">
 <img width="800" height="440" alt="image" src="https://github.com/user-attachments/assets/c5f2c34b-3fd1-40c7-b9e6-f45c25f5d427" />
