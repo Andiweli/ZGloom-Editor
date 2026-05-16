@@ -157,6 +157,13 @@ namespace
         int width = 0;
         int height = 0;
         int colors = 0;
+        int paletteStorageValue = -1;
+        int uniquePaletteColors = 0;
+        int usedVisibleColors = 0;
+        int usedColorIndexes = 0;
+        int minUsedColorIndex = -1;
+        int maxUsedColorIndex = -1;
+        int outOfPaletteIndexes = 0;
         int wallColumns = 0;
         int wallTextureCount = 0;
         std::wstring error;
@@ -193,6 +200,54 @@ namespace
         int previewScrollDragOffsetX = 0;
         bool previewScrollHover = false;
         bool previewScrollDragging = false;
+    };
+
+    enum class TextureImportDither
+    {
+        NoDither,
+        Ordered2x2Soft,
+        Ordered2x2,
+        Ordered4x4,
+        FloydSteinberg,
+    };
+
+    enum class TextureImportPreprocess
+    {
+        Off,
+        VeryLightPosterize,
+        LightPosterize,
+        GloomOptimized,
+        StrongPosterize,
+    };
+
+    enum class TextureImportColorMode
+    {
+        Original,
+        Force16,
+        Force32,
+        Force64,
+    };
+
+    struct TextureImportOptions
+    {
+        TextureImportDither dither = TextureImportDither::Ordered2x2Soft;
+        TextureImportPreprocess preprocess = TextureImportPreprocess::VeryLightPosterize;
+        TextureImportColorMode colorMode = TextureImportColorMode::Original;
+        bool accepted = false;
+    };
+
+    struct TextureImportOptionsDialog
+    {
+        HWND owner = nullptr;
+        HWND hwnd = nullptr;
+        HWND ditherCombo = nullptr;
+        HWND preprocessCombo = nullptr;
+        HWND colorsCombo = nullptr;
+        HWND info = nullptr;
+        HWND ok = nullptr;
+        HWND cancel = nullptr;
+        HFONT font = nullptr;
+        TextureImportOptions options;
     };
 
 
@@ -339,6 +394,11 @@ namespace
     constexpr int IDC_TEXTURE_IMPORT_PNG = 52204;
     constexpr int IDC_TEXTURE_CLOSE = 52205;
     constexpr int IDC_TEXTURE_HSCROLL = 52206;
+    constexpr int IDC_TEXTURE_IMPORT_DITHER = 52207;
+    constexpr int IDC_TEXTURE_IMPORT_PREPROCESS = 52208;
+    constexpr int IDC_TEXTURE_IMPORT_OK = 52209;
+    constexpr int IDC_TEXTURE_IMPORT_CANCEL = 52210;
+    constexpr int IDC_TEXTURE_IMPORT_INFO = 52211;
 
     constexpr int IDC_NEW_CAMPAIGN_TEMPLATE = 52301;
     constexpr int IDC_NEW_CAMPAIGN_TEMPLATE_ROOT = 52302;
@@ -3576,6 +3636,241 @@ namespace
             indexed[i] = static_cast<std::uint8_t>(NearestPaletteIndex(input[i], palette));
     }
 
+
+    int ClampToByte(int v)
+    {
+        return std::clamp(v, 0, 255);
+    }
+
+    std::uint8_t PosterizeChannel(std::uint8_t value, int levels)
+    {
+        levels = std::clamp(levels, 2, 256);
+        if (levels >= 256)
+            return value;
+        const int stepCount = levels - 1;
+        const int q = static_cast<int>(std::round((static_cast<double>(value) / 255.0) * stepCount));
+        return static_cast<std::uint8_t>(ClampToByte(static_cast<int>(std::round((static_cast<double>(q) * 255.0) / stepCount))));
+    }
+
+    void ApplyTextureImportPreprocess(std::vector<RgbColor>& pixels, const std::vector<std::uint8_t>& alpha, TextureImportPreprocess mode)
+    {
+        if (mode == TextureImportPreprocess::Off)
+            return;
+
+        double contrast = 1.025;
+        int levels = 96;
+        if (mode == TextureImportPreprocess::LightPosterize)
+        {
+            contrast = 1.06;
+            levels = 64;
+        }
+        else if (mode == TextureImportPreprocess::GloomOptimized)
+        {
+            contrast = 1.14;
+            levels = 48;
+        }
+        else if (mode == TextureImportPreprocess::StrongPosterize)
+        {
+            contrast = 1.35;
+            levels = 16;
+        }
+        for (size_t i = 0; i < pixels.size(); ++i)
+        {
+            if (i < alpha.size() && alpha[i] < 128)
+                continue;
+
+            auto fix = [&](std::uint8_t channel) -> std::uint8_t {
+                const int contrasted = ClampToByte(static_cast<int>(std::round((static_cast<double>(channel) - 128.0) * contrast + 128.0)));
+                return PosterizeChannel(static_cast<std::uint8_t>(contrasted), levels);
+            };
+
+            pixels[i].r = fix(pixels[i].r);
+            pixels[i].g = fix(pixels[i].g);
+            pixels[i].b = fix(pixels[i].b);
+        }
+    }
+
+    int NearestPaletteIndexInRange(const RgbColor& c, const std::vector<RgbColor>& palette, int firstIndex)
+    {
+        if (palette.empty())
+            return 0;
+        firstIndex = std::clamp(firstIndex, 0, std::max(0, static_cast<int>(palette.size()) - 1));
+        int best = firstIndex;
+        int bestDist = INT_MAX;
+        for (int i = firstIndex; i < static_cast<int>(palette.size()); ++i)
+        {
+            const int dr = static_cast<int>(c.r) - static_cast<int>(palette[static_cast<size_t>(i)].r);
+            const int dg = static_cast<int>(c.g) - static_cast<int>(palette[static_cast<size_t>(i)].g);
+            const int db = static_cast<int>(c.b) - static_cast<int>(palette[static_cast<size_t>(i)].b);
+            const int dist = dr * dr + dg * dg + db * db;
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                best = i;
+                if (dist == 0)
+                    break;
+            }
+        }
+        return best;
+    }
+
+    RgbColor AdjustForOrderedDither(const RgbColor& c, int x, int y, TextureImportDither mode)
+    {
+        int threshold = 0;
+        int strength = 0;
+
+        if (mode == TextureImportDither::Ordered2x2Soft || mode == TextureImportDither::Ordered2x2)
+        {
+            static constexpr int bayer2[2][2] = {
+                { 0, 2 },
+                { 3, 1 },
+            };
+            threshold = bayer2[y & 1][x & 1] * 4 + 2 - 8;
+            strength = (mode == TextureImportDither::Ordered2x2Soft) ? 4 : 9;
+        }
+        else
+        {
+            static constexpr int bayer4[4][4] = {
+                {  0,  8,  2, 10 },
+                { 12,  4, 14,  6 },
+                {  3, 11,  1,  9 },
+                { 15,  7, 13,  5 },
+            };
+            threshold = bayer4[y & 3][x & 3] - 8;
+            strength = 12;
+        }
+
+        const int delta = threshold * strength / 8;
+        return {
+            static_cast<std::uint8_t>(ClampToByte(static_cast<int>(c.r) + delta)),
+            static_cast<std::uint8_t>(ClampToByte(static_cast<int>(c.g) + delta)),
+            static_cast<std::uint8_t>(ClampToByte(static_cast<int>(c.b) + delta)),
+        };
+    }
+
+    bool IsTextureTransparencyKeyColor(const RgbColor& c)
+    {
+        // Texture import transparency key: bright blue.
+        //
+        // The old check accepted only the exact RGB value #0000FF. That is
+        // too fragile for PNGs that were palette-converted, saved through an
+        // Amiga/12-bit path, or touched by a tool that writes the key as
+        // #0000FE/#0000F0. Treat only a very small, saturated blue range as
+        // transparent; pure black remains a normal visible color.
+        const int r = static_cast<int>(c.r);
+        const int g = static_cast<int>(c.g);
+        const int b = static_cast<int>(c.b);
+        return r <= 16 && g <= 16 && b >= 232 && (b - std::max(r, g)) >= 216;
+    }
+
+    int NormalizeTextureTransparencyKeyPixels(std::vector<RgbColor>& pixels, std::vector<std::uint8_t>& alpha)
+    {
+        if (alpha.size() < pixels.size())
+            alpha.resize(pixels.size(), 255);
+
+        int changed = 0;
+        for (size_t i = 0; i < pixels.size(); ++i)
+        {
+            if (IsTextureTransparencyKeyColor(pixels[i]))
+            {
+                // Convert the color-key to real alpha before any preprocessing,
+                // quantizing or dithering. Keep RGB black afterwards so the key
+                // color can never leak into the quantizer or palette even if a
+                // later path accidentally looks only at RGB.
+                alpha[i] = 0;
+                pixels[i] = { 0, 0, 0 };
+                ++changed;
+            }
+        }
+        return changed;
+    }
+
+    bool ShouldForceTextureIndexZero(const std::vector<RgbColor>& input, const std::vector<std::uint8_t>& alpha, size_t index, bool reserveZero)
+    {
+        if (!reserveZero)
+            return false;
+        if (index < alpha.size() && alpha[index] < 128)
+            return true;
+        return index < input.size() && IsTextureTransparencyKeyColor(input[index]);
+    }
+
+    void MapPixelsToPalette(const std::vector<RgbColor>& input, const std::vector<std::uint8_t>& alpha, int width, int height, const std::vector<RgbColor>& palette, bool reserveZero, TextureImportDither dither, std::vector<std::uint8_t>& indexed)
+    {
+        indexed.assign(input.size(), 0);
+        if (input.empty() || palette.empty() || width <= 0 || height <= 0)
+            return;
+
+        const int firstColor = reserveZero ? 1 : 0;
+        if (dither == TextureImportDither::FloydSteinberg)
+        {
+            struct ErrorPixel { double r = 0.0; double g = 0.0; double b = 0.0; };
+            std::vector<ErrorPixel> work(input.size());
+            for (size_t i = 0; i < input.size(); ++i)
+            {
+                work[i].r = input[i].r;
+                work[i].g = input[i].g;
+                work[i].b = input[i].b;
+            }
+
+            auto addErr = [&](int x, int y, double er, double eg, double eb, double factor) {
+                if (x < 0 || y < 0 || x >= width || y >= height)
+                    return;
+                const size_t ni = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                if (ShouldForceTextureIndexZero(input, alpha, ni, reserveZero))
+                    return;
+                work[ni].r += er * factor;
+                work[ni].g += eg * factor;
+                work[ni].b += eb * factor;
+            };
+
+            for (int y = 0; y < height; ++y)
+            {
+                for (int x = 0; x < width; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                    if (ShouldForceTextureIndexZero(input, alpha, i, reserveZero))
+                    {
+                        indexed[i] = 0;
+                        continue;
+                    }
+                    const RgbColor c{
+                        static_cast<std::uint8_t>(ClampToByte(static_cast<int>(std::round(work[i].r)))),
+                        static_cast<std::uint8_t>(ClampToByte(static_cast<int>(std::round(work[i].g)))),
+                        static_cast<std::uint8_t>(ClampToByte(static_cast<int>(std::round(work[i].b)))),
+                    };
+                    const int palIndex = NearestPaletteIndexInRange(c, palette, firstColor);
+                    indexed[i] = static_cast<std::uint8_t>(palIndex);
+                    const RgbColor pc = palette[static_cast<size_t>(palIndex)];
+                    const double er = work[i].r - pc.r;
+                    const double eg = work[i].g - pc.g;
+                    const double eb = work[i].b - pc.b;
+                    addErr(x + 1, y,     er, eg, eb, 7.0 / 16.0);
+                    addErr(x - 1, y + 1, er, eg, eb, 3.0 / 16.0);
+                    addErr(x,     y + 1, er, eg, eb, 5.0 / 16.0);
+                    addErr(x + 1, y + 1, er, eg, eb, 1.0 / 16.0);
+                }
+            }
+            return;
+        }
+
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+                if (ShouldForceTextureIndexZero(input, alpha, i, reserveZero))
+                {
+                    indexed[i] = 0;
+                    continue;
+                }
+                RgbColor c = input[i];
+                if (dither == TextureImportDither::Ordered2x2Soft || dither == TextureImportDither::Ordered2x2 || dither == TextureImportDither::Ordered4x4)
+                    c = AdjustForOrderedDither(c, x, y, dither);
+                indexed[i] = static_cast<std::uint8_t>(NearestPaletteIndexInRange(c, palette, firstColor));
+            }
+        }
+    }
+
     constexpr int kGloomDeluxePictureFirstImageSlot = 64;
     constexpr int kGloomDeluxeFontFixedSlots = 4;
 
@@ -3815,6 +4110,30 @@ namespace
         return c;
     }
 
+    std::uint16_t EncodeRgbToAmiga12Word(const RgbColor& c)
+    {
+        const std::uint16_t r = static_cast<std::uint16_t>(((static_cast<int>(c.r) + 8) / 17) & 0x0F);
+        const std::uint16_t g = static_cast<std::uint16_t>(((static_cast<int>(c.g) + 8) / 17) & 0x0F);
+        const std::uint16_t b = static_cast<std::uint16_t>(((static_cast<int>(c.b) + 8) / 17) & 0x0F);
+        return static_cast<std::uint16_t>((r << 8) | (g << 4) | b);
+    }
+
+    RgbColor SnapRgbToAmiga12(const RgbColor& c)
+    {
+        return DecodeAmiga12(EncodeRgbToAmiga12Word(c));
+    }
+
+    int CountSet4096(const bool (&used)[4096])
+    {
+        int count = 0;
+        for (bool v : used)
+        {
+            if (v)
+                ++count;
+        }
+        return count;
+    }
+
     bool IsTextureBackupOrExport(const fs::path& file)
     {
         const std::wstring name = Lower(file.filename().wstring());
@@ -3847,6 +4166,48 @@ namespace
             info.width = 128;
             info.height = 128;
             info.colors = static_cast<int>((raw.size() - 128U * 128U) / 2U);
+            info.paletteStorageValue = info.colors;
+            bool paletteWordsUsed[4096]{};
+            std::vector<std::uint16_t> paletteWords;
+            paletteWords.reserve(static_cast<size_t>(std::max(0, info.colors)));
+            for (int i = 0; i < info.colors; ++i)
+            {
+                const size_t po = 128U * 128U + static_cast<size_t>(i) * 2U;
+                if (po + 1U < raw.size())
+                {
+                    const std::uint16_t word = ReadBE16(raw.data() + po) & 0x0FFFU;
+                    paletteWords.push_back(word);
+                    paletteWordsUsed[word] = true;
+                }
+            }
+            info.uniquePaletteColors = CountSet4096(paletteWordsUsed);
+
+            bool used[256]{};
+            bool visibleWordsUsed[4096]{};
+            int usedCount = 0;
+            int minIdx = 256;
+            int maxIdx = -1;
+            int outOfPalette = 0;
+            for (size_t i = 0; i < 128U * 128U && i < raw.size(); ++i)
+            {
+                const int idx = static_cast<int>(raw[i]);
+                if (!used[idx])
+                {
+                    used[idx] = true;
+                    ++usedCount;
+                }
+                minIdx = std::min(minIdx, idx);
+                maxIdx = std::max(maxIdx, idx);
+                if (idx >= info.colors)
+                    ++outOfPalette;
+                else if (idx >= 0 && idx < static_cast<int>(paletteWords.size()))
+                    visibleWordsUsed[paletteWords[static_cast<size_t>(idx)] & 0x0FFFU] = true;
+            }
+            info.usedVisibleColors = CountSet4096(visibleWordsUsed);
+            info.usedColorIndexes = usedCount;
+            info.minUsedColorIndex = (usedCount > 0) ? minIdx : -1;
+            info.maxUsedColorIndex = maxIdx;
+            info.outOfPaletteIndexes = outOfPalette;
             return info;
         }
 
@@ -3865,6 +4226,54 @@ namespace
                     info.width = 64;
                     info.height = info.wallTextureCount * 64;
                     info.colors = static_cast<int>(entries) + 1;
+                    info.paletteStorageValue = static_cast<int>(entries);
+                    bool paletteWordsUsed[4096]{};
+                    std::vector<std::uint16_t> paletteWords(static_cast<size_t>(info.colors), 0);
+                    paletteWordsUsed[0] = true;
+                    for (int i = 0; i < static_cast<int>(entries); ++i)
+                    {
+                        const size_t po = static_cast<size_t>(paletteOffset) + 2U + static_cast<size_t>(i) * 2U;
+                        if (po + 1U < raw.size())
+                        {
+                            const std::uint16_t word = ReadBE16(raw.data() + po) & 0x0FFFU;
+                            paletteWords[static_cast<size_t>(i + 1)] = word;
+                            paletteWordsUsed[word] = true;
+                        }
+                    }
+                    info.uniquePaletteColors = CountSet4096(paletteWordsUsed);
+
+                    bool used[256]{};
+                    bool visibleWordsUsed[4096]{};
+                    int usedCount = 0;
+                    int minIdx = 256;
+                    int maxIdx = -1;
+                    int outOfPalette = 0;
+                    for (int column = 0; column < info.wallColumns; ++column)
+                    {
+                        const size_t base = 4U + static_cast<size_t>(column) * 65U + 1U;
+                        if (base + 64U > raw.size())
+                            break;
+                        for (int y = 0; y < 64; ++y)
+                        {
+                            const int idx = static_cast<int>(raw[base + static_cast<size_t>(y)]);
+                            if (!used[idx])
+                            {
+                                used[idx] = true;
+                                ++usedCount;
+                            }
+                            minIdx = std::min(minIdx, idx);
+                            maxIdx = std::max(maxIdx, idx);
+                            if (idx >= info.colors)
+                                ++outOfPalette;
+                            else if (idx >= 0 && idx < static_cast<int>(paletteWords.size()))
+                                visibleWordsUsed[paletteWords[static_cast<size_t>(idx)] & 0x0FFFU] = true;
+                        }
+                    }
+                    info.usedVisibleColors = CountSet4096(visibleWordsUsed);
+                    info.usedColorIndexes = usedCount;
+                    info.minUsedColorIndex = (usedCount > 0) ? minIdx : -1;
+                    info.maxUsedColorIndex = maxIdx;
+                    info.outOfPaletteIndexes = outOfPalette;
                     return info;
                 }
             }
@@ -4159,10 +4568,7 @@ namespace
 
     std::uint16_t EncodeAmiga12(const RgbColor& c)
     {
-        const std::uint16_t r = static_cast<std::uint16_t>(((static_cast<int>(c.r) + 8) / 17) & 0x0F);
-        const std::uint16_t g = static_cast<std::uint16_t>(((static_cast<int>(c.g) + 8) / 17) & 0x0F);
-        const std::uint16_t b = static_cast<std::uint16_t>(((static_cast<int>(c.b) + 8) / 17) & 0x0F);
-        return static_cast<std::uint16_t>((r << 8) | (g << 4) | b);
+        return EncodeRgbToAmiga12Word(c);
     }
 
     void WriteBE16(std::vector<std::uint8_t>& out, size_t pos, std::uint16_t value)
@@ -4181,6 +4587,150 @@ namespace
         out[pos + 1] = static_cast<std::uint8_t>((value >> 16) & 0xffU);
         out[pos + 2] = static_cast<std::uint8_t>((value >> 8) & 0xffU);
         out[pos + 3] = static_cast<std::uint8_t>(value & 0xffU);
+    }
+
+
+    constexpr size_t kAmigaFlatWidth = 128U;
+    constexpr size_t kAmigaFlatHeight = 128U;
+    constexpr size_t kAmigaFlatPixelBytes = kAmigaFlatWidth * kAmigaFlatHeight;
+
+    const std::array<std::uint16_t, 64> kGloomFlatFallbackPaletteWords = {
+        0x03f, 0x700, 0xb00, 0xf00, 0x232, 0x474, 0x6b6, 0x8f8,
+        0xf30, 0xf70, 0xfb0, 0xff0, 0x339, 0x77b, 0xbbd, 0xfff,
+        0x333, 0x444, 0x666, 0x777, 0x111, 0x333, 0x555, 0x666,
+        0x210, 0x320, 0x430, 0x540, 0x021, 0x032, 0x043, 0x054,
+        0x012, 0x023, 0x034, 0x045, 0x123, 0x234, 0x456, 0x567,
+        0x321, 0x432, 0x543, 0x654, 0x132, 0x243, 0x354, 0x465,
+        0x213, 0x324, 0x435, 0x546, 0x222, 0x333, 0x444, 0x555,
+        0x444, 0x555, 0x666, 0x777, 0x310, 0x420, 0x520, 0x630
+    };
+
+    bool ReadAmigaFlatPaletteBlock(const std::vector<std::uint8_t>& raw,
+        std::vector<std::uint8_t>& paletteBytes,
+        std::vector<RgbColor>& paletteColors)
+    {
+        if (raw.size() < kAmigaFlatPixelBytes + 2U || ((raw.size() - kAmigaFlatPixelBytes) % 2U) != 0)
+            return false;
+
+        const size_t entries = (raw.size() - kAmigaFlatPixelBytes) / 2U;
+        if (entries < 2U || entries > 64U)
+            return false;
+
+        paletteBytes.assign(raw.begin() + static_cast<std::ptrdiff_t>(kAmigaFlatPixelBytes), raw.end());
+        paletteColors.assign(entries, {});
+        for (size_t i = 0; i < entries; ++i)
+        {
+            const size_t po = i * 2U;
+            paletteColors[i] = DecodeAmiga12(ReadBE16(paletteBytes.data() + po));
+        }
+        return true;
+    }
+
+    bool IsUsableAmigaFlatPaletteBlock(const std::vector<std::uint8_t>& paletteBytes)
+    {
+        if (paletteBytes.size() < 32U || (paletteBytes.size() % 2U) != 0)
+            return false;
+
+        const size_t entries = paletteBytes.size() / 2U;
+        int nonZeroWords = 0;
+        bool hasHighBankColors = false;
+        for (size_t i = 0; i < entries; ++i)
+        {
+            const std::uint16_t w = ReadBE16(paletteBytes.data() + i * 2U);
+            if (w != 0)
+            {
+                ++nonZeroWords;
+                if (i >= 16U)
+                    hasHighBankColors = true;
+            }
+        }
+
+        // Real Gloom floor/roof flats use a populated 64-slot palette/light-bank
+        // layout. Editor-generated broken files only contain a tiny low-index
+        // palette (typically 8-9 entries) and the rest is zero, which looks valid
+        // by size but is unsafe on a real Amiga.
+        if (entries >= 64U)
+            return nonZeroWords >= 24 && hasHighBankColors;
+
+        return nonZeroWords >= 16;
+    }
+
+    bool TryLoadAmigaFlatPaletteReference(const fs::path& file,
+        std::vector<std::uint8_t>& paletteBytes,
+        std::vector<RgbColor>& paletteColors)
+    {
+        std::wstring ignoredError;
+        std::vector<std::uint8_t> raw;
+        if (!LoadMaybeCrM2(file, raw, ignoredError))
+            return false;
+
+        std::vector<std::uint8_t> candidateBytes;
+        std::vector<RgbColor> candidateColors;
+        if (!ReadAmigaFlatPaletteBlock(raw, candidateBytes, candidateColors))
+            return false;
+        if (!IsUsableAmigaFlatPaletteBlock(candidateBytes))
+            return false;
+
+        paletteBytes = std::move(candidateBytes);
+        paletteColors = std::move(candidateColors);
+        return true;
+    }
+
+    void UseBuiltInGloomFlatPalette(std::vector<std::uint8_t>& paletteBytes,
+        std::vector<RgbColor>& paletteColors)
+    {
+        paletteBytes.assign(kGloomFlatFallbackPaletteWords.size() * 2U, 0);
+        paletteColors.assign(kGloomFlatFallbackPaletteWords.size(), {});
+        for (size_t i = 0; i < kGloomFlatFallbackPaletteWords.size(); ++i)
+        {
+            const std::uint16_t w = kGloomFlatFallbackPaletteWords[i];
+            paletteBytes[i * 2U + 0U] = static_cast<std::uint8_t>((w >> 8) & 0xffU);
+            paletteBytes[i * 2U + 1U] = static_cast<std::uint8_t>(w & 0xffU);
+            paletteColors[i] = DecodeAmiga12(w);
+        }
+    }
+
+    bool LoadAmigaFlatPaletteReference(const fs::path& currentFile,
+        const std::vector<std::uint8_t>& currentRaw,
+        std::vector<std::uint8_t>& paletteBytes,
+        std::vector<RgbColor>& paletteColors)
+    {
+        std::vector<std::uint8_t> candidateBytes;
+        std::vector<RgbColor> candidateColors;
+        if (ReadAmigaFlatPaletteBlock(currentRaw, candidateBytes, candidateColors) &&
+            IsUsableAmigaFlatPaletteBlock(candidateBytes))
+        {
+            paletteBytes = std::move(candidateBytes);
+            paletteColors = std::move(candidateColors);
+            return true;
+        }
+
+        const fs::path folder = currentFile.parent_path();
+        const std::wstring baseName = Lower(currentFile.filename().wstring());
+        if (!folder.empty() && DirExists(folder) && !baseName.empty())
+        {
+            std::vector<fs::path> backups;
+            const std::wstring backupPrefix = baseName + L".";
+            for (const fs::path& f : ListRegularFiles(folder))
+            {
+                const std::wstring fn = Lower(f.filename().wstring());
+                if (StartsWith(fn, backupPrefix.c_str()) && EndsWith(fn, L".bak"))
+                    backups.push_back(f);
+            }
+
+            std::sort(backups.begin(), backups.end(), [](const fs::path& a, const fs::path& b) {
+                return Lower(a.filename().wstring()) > Lower(b.filename().wstring());
+            });
+
+            for (const fs::path& backup : backups)
+            {
+                if (TryLoadAmigaFlatPaletteReference(backup, paletteBytes, paletteColors))
+                    return true;
+            }
+        }
+
+        UseBuiltInGloomFlatPalette(paletteBytes, paletteColors);
+        return true;
     }
 
     bool LoadPngScaled(HWND owner, const fs::path& pngPath, int width, int height, std::vector<RgbColor>& pixels, std::vector<std::uint8_t>& alpha, std::wstring& error)
@@ -4225,8 +4775,9 @@ namespace
                 Gdiplus::Color c;
                 source.GetPixel(sx, sy, &c);
                 const size_t i = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
-                alpha[i] = c.GetA();
-                pixels[i] = { static_cast<std::uint8_t>(c.GetR()), static_cast<std::uint8_t>(c.GetG()), static_cast<std::uint8_t>(c.GetB()) };
+                RgbColor rgb{ static_cast<std::uint8_t>(c.GetR()), static_cast<std::uint8_t>(c.GetG()), static_cast<std::uint8_t>(c.GetB()) };
+                alpha[i] = IsTextureTransparencyKeyColor(rgb) ? 0 : c.GetA();
+                pixels[i] = (alpha[i] < 128 && IsTextureTransparencyKeyColor(rgb)) ? RgbColor{ 0, 0, 0 } : rgb;
             }
         }
         error.clear();
@@ -4291,14 +4842,40 @@ namespace
         return true;
     }
 
-    void QuantizeColorsReservedZero(const std::vector<RgbColor>& input, const std::vector<std::uint8_t>& alpha, int maxColorsIncludingZero, std::vector<RgbColor>& palette, std::vector<std::uint8_t>& indexed)
+    void NormalizeTexturePaletteToAmiga12Unique(std::vector<RgbColor>& palette, int desiredEntries, bool reserveZero)
+    {
+        const int safeEntries = std::clamp(desiredEntries, 1, 256);
+        bool seen[4096]{};
+        if (reserveZero)
+            seen[0] = true;
+
+        std::vector<RgbColor> unique;
+        unique.reserve(static_cast<size_t>(safeEntries));
+        for (const RgbColor& c : palette)
+        {
+            const std::uint16_t word = EncodeRgbToAmiga12Word(c) & 0x0FFFU;
+            if (seen[word])
+                continue;
+            seen[word] = true;
+            unique.push_back(DecodeAmiga12(word));
+            if (static_cast<int>(unique.size()) >= safeEntries)
+                break;
+        }
+        if (unique.empty())
+            unique.push_back({ 0, 0, 0 });
+        while (static_cast<int>(unique.size()) < safeEntries)
+            unique.push_back({ 0, 0, 0 });
+        palette.swap(unique);
+    }
+
+    void QuantizeColorsReservedZero(const std::vector<RgbColor>& input, const std::vector<std::uint8_t>& alpha, int width, int height, int maxColorsIncludingZero, TextureImportDither dither, std::vector<RgbColor>& palette, std::vector<std::uint8_t>& indexed)
     {
         const int storedColors = std::clamp(maxColorsIncludingZero - 1, 1, 255);
         std::vector<RgbColor> opaque;
         opaque.reserve(input.size());
         for (size_t i = 0; i < input.size(); ++i)
         {
-            if (i >= alpha.size() || alpha[i] >= 128)
+            if (!ShouldForceTextureIndexZero(input, alpha, i, true))
                 opaque.push_back(input[i]);
         }
         if (opaque.empty())
@@ -4307,6 +4884,7 @@ namespace
         std::vector<RgbColor> qpal;
         std::vector<std::uint8_t> unused;
         QuantizeColors(opaque, storedColors, qpal, unused);
+        NormalizeTexturePaletteToAmiga12Unique(qpal, storedColors, true);
 
         palette.clear();
         palette.reserve(static_cast<size_t>(storedColors) + 1U);
@@ -4319,33 +4897,242 @@ namespace
                 palette.push_back({ 0, 0, 0 });
         }
 
-        indexed.resize(input.size());
-        for (size_t i = 0; i < input.size(); ++i)
+        MapPixelsToPalette(input, alpha, width, height, palette, true, dither, indexed);
+    }
+
+    void LayoutTextureImportOptions(TextureImportOptionsDialog* dlg)
+    {
+        if (!dlg || !dlg->hwnd)
+            return;
+        RECT rc{};
+        GetClientRect(dlg->hwnd, &rc);
+        const int w = rc.right - rc.left;
+        const int margin = 18;
+        const int labelW = 126;
+        const int comboW = w - margin * 2 - labelW - 10;
+        const int comboH = 160;
+        const int rowH = 26;
+        const int top = 18;
+
+        HWND labelDither = GetDlgItem(dlg->hwnd, 1);
+        HWND labelProcess = GetDlgItem(dlg->hwnd, 2);
+        HWND labelColors = GetDlgItem(dlg->hwnd, 3);
+        if (labelDither)
+            MoveWindow(labelDither, margin, top + 2, labelW, 20, TRUE);
+        if (dlg->ditherCombo)
+            MoveWindow(dlg->ditherCombo, margin + labelW + 10, top, comboW, comboH, TRUE);
+        if (labelProcess)
+            MoveWindow(labelProcess, margin, top + rowH + 12, labelW, 20, TRUE);
+        if (dlg->preprocessCombo)
+            MoveWindow(dlg->preprocessCombo, margin + labelW + 10, top + rowH + 10, comboW, comboH, TRUE);
+        if (labelColors)
+            MoveWindow(labelColors, margin, top + rowH * 2 + 22, labelW, 20, TRUE);
+        if (dlg->colorsCombo)
+            MoveWindow(dlg->colorsCombo, margin + labelW + 10, top + rowH * 2 + 20, comboW, comboH, TRUE);
+        if (dlg->info)
+            MoveWindow(dlg->info, margin, top + rowH * 3 + 34, w - margin * 2, 54, TRUE);
+
+        const int buttonW = 104;
+        const int buttonH = 30;
+        const int gap = 10;
+        const int y = rc.bottom - margin - buttonH;
+        const int x = rc.right - margin - buttonW * 2 - gap;
+        if (dlg->ok)
+            MoveWindow(dlg->ok, x, y, buttonW, buttonH, TRUE);
+        if (dlg->cancel)
+            MoveWindow(dlg->cancel, x + buttonW + gap, y, buttonW, buttonH, TRUE);
+    }
+
+    LRESULT CALLBACK TextureImportOptionsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        TextureImportOptionsDialog* dlg = reinterpret_cast<TextureImportOptionsDialog*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        switch (msg)
         {
-            if (i < alpha.size() && alpha[i] < 128)
+        case WM_NCCREATE:
+        {
+            auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            dlg = reinterpret_cast<TextureImportOptionsDialog*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(dlg));
+            dlg->hwnd = hwnd;
+            return TRUE;
+        }
+        case WM_CREATE:
+            if (dlg)
             {
-                indexed[i] = 0;
-                continue;
-            }
-            int best = 0;
-            int bestDist = INT_MAX;
-            for (int p = 1; p < static_cast<int>(palette.size()); ++p)
-            {
-                const RgbColor& pc = palette[static_cast<size_t>(p)];
-                const int dr = static_cast<int>(input[i].r) - static_cast<int>(pc.r);
-                const int dg = static_cast<int>(input[i].g) - static_cast<int>(pc.g);
-                const int db = static_cast<int>(input[i].b) - static_cast<int>(pc.b);
-                const int dist = dr * dr + dg * dg + db * db;
-                if (dist < bestDist)
+                ApplyDarkFrame(hwnd);
+                dlg->font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                HWND labelDither = CreateWindowW(L"STATIC", L"Dithering", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
+                HWND labelProcess = CreateWindowW(L"STATIC", L"Preprocess", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(2), GetModuleHandleW(nullptr), nullptr);
+                HWND labelColors = CreateWindowW(L"STATIC", L"Target colors", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(3), GetModuleHandleW(nullptr), nullptr);
+                dlg->ditherCombo = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_DITHER), GetModuleHandleW(nullptr), nullptr);
+                dlg->preprocessCombo = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_PREPROCESS), GetModuleHandleW(nullptr), nullptr);
+                dlg->colorsCombo = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_INFO + 100), GetModuleHandleW(nullptr), nullptr);
+                dlg->info = CreateWindowW(L"STATIC", L"Recommended for Photoshop imports: Very light contrast/posterize + Ordered 2x2 soft.\n32/64 colors should be verified in ZGloom and on a real Amiga.", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_INFO), GetModuleHandleW(nullptr), nullptr);
+                dlg->ok = CreateWindowW(L"BUTTON", L"Import", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_OK), GetModuleHandleW(nullptr), nullptr);
+                dlg->cancel = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_TEXTURE_IMPORT_CANCEL), GetModuleHandleW(nullptr), nullptr);
+
+                for (HWND child : { labelDither, labelProcess, labelColors, dlg->ditherCombo, dlg->preprocessCombo, dlg->colorsCombo, dlg->info, dlg->ok, dlg->cancel })
                 {
-                    bestDist = dist;
-                    best = p;
-                    if (dist == 0)
-                        break;
+                    if (child)
+                    {
+                        SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(dlg->font), TRUE);
+                        ApplyDarkFrame(child);
+                    }
+                }
+
+                SendMessageW(dlg->ditherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"None"));
+                SendMessageW(dlg->ditherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Ordered 2x2 soft"));
+                SendMessageW(dlg->ditherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Ordered 2x2"));
+                SendMessageW(dlg->ditherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Ordered 4x4"));
+                SendMessageW(dlg->ditherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Floyd-Steinberg"));
+                SendMessageW(dlg->ditherCombo, CB_SETCURSEL, 1, 0);
+
+                SendMessageW(dlg->preprocessCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Off"));
+                SendMessageW(dlg->preprocessCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Very light contrast/posterize"));
+                SendMessageW(dlg->preprocessCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Light contrast/posterize"));
+                SendMessageW(dlg->preprocessCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gloom optimized contrast/posterize"));
+                SendMessageW(dlg->preprocessCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Strong posterize"));
+                SendMessageW(dlg->preprocessCombo, CB_SETCURSEL, 1, 0);
+
+                SendMessageW(dlg->colorsCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Original"));
+                SendMessageW(dlg->colorsCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"16 colors"));
+                SendMessageW(dlg->colorsCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"32 colors"));
+                SendMessageW(dlg->colorsCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"64 colors"));
+                SendMessageW(dlg->colorsCombo, CB_SETCURSEL, 3, 0);
+
+                LayoutTextureImportOptions(dlg);
+            }
+            return 0;
+        case WM_SIZE:
+            LayoutTextureImportOptions(dlg);
+            return 0;
+        case WM_ERASEBKGND:
+        {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            HBRUSH brush = CreateSolidBrush(kBg);
+            FillRect(hdc, &rc, brush);
+            DeleteObject(brush);
+            return 1;
+        }
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORLISTBOX:
+            return DarkPopupCtlColor(wParam, false);
+        case WM_CTLCOLOREDIT:
+            return DarkPopupCtlColor(wParam, true);
+        case WM_DRAWITEM:
+            return DrawDarkPopupButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam)) ? TRUE : FALSE;
+        case WM_COMMAND:
+            if (dlg)
+            {
+                const int id = LOWORD(wParam);
+                if (id == IDC_TEXTURE_IMPORT_OK)
+                {
+                    const int dither = static_cast<int>(SendMessageW(dlg->ditherCombo, CB_GETCURSEL, 0, 0));
+                    const int preprocess = static_cast<int>(SendMessageW(dlg->preprocessCombo, CB_GETCURSEL, 0, 0));
+                    switch (dither)
+                    {
+                        case 1: dlg->options.dither = TextureImportDither::Ordered2x2Soft; break;
+                        case 2: dlg->options.dither = TextureImportDither::Ordered2x2; break;
+                        case 3: dlg->options.dither = TextureImportDither::Ordered4x4; break;
+                        case 4: dlg->options.dither = TextureImportDither::FloydSteinberg; break;
+                        default: dlg->options.dither = TextureImportDither::NoDither; break;
+                    }
+                    switch (preprocess)
+                    {
+                        case 1: dlg->options.preprocess = TextureImportPreprocess::VeryLightPosterize; break;
+                        case 2: dlg->options.preprocess = TextureImportPreprocess::LightPosterize; break;
+                        case 3: dlg->options.preprocess = TextureImportPreprocess::GloomOptimized; break;
+                        case 4: dlg->options.preprocess = TextureImportPreprocess::StrongPosterize; break;
+                        default: dlg->options.preprocess = TextureImportPreprocess::Off; break;
+                    }
+                    const int colors = static_cast<int>(SendMessageW(dlg->colorsCombo, CB_GETCURSEL, 0, 0));
+                    switch (colors)
+                    {
+                        case 1: dlg->options.colorMode = TextureImportColorMode::Force16; break;
+                        case 2: dlg->options.colorMode = TextureImportColorMode::Force32; break;
+                        case 3: dlg->options.colorMode = TextureImportColorMode::Force64; break;
+                        default: dlg->options.colorMode = TextureImportColorMode::Original; break;
+                    }
+                    dlg->options.accepted = true;
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (id == IDC_TEXTURE_IMPORT_CANCEL)
+                {
+                    dlg->options.accepted = false;
+                    DestroyWindow(hwnd);
+                    return 0;
                 }
             }
-            indexed[i] = static_cast<std::uint8_t>(best);
+            break;
+        case WM_CLOSE:
+            if (dlg)
+                dlg->options.accepted = false;
+            DestroyWindow(hwnd);
+            return 0;
         }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    bool ShowTextureImportOptions(HWND owner, TextureImportOptions& options)
+    {
+        static bool registered = false;
+        const wchar_t* className = L"ZGloomTextureImportOptionsWindow";
+        if (!registered)
+        {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = className;
+            wc.lpfnWndProc = TextureImportOptionsWndProc;
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            wc.hbrBackground = CreateSolidBrush(kBg);
+            RegisterClassExW(&wc);
+            registered = true;
+        }
+
+        TextureImportOptionsDialog dlg;
+        dlg.owner = owner;
+        dlg.options = options;
+
+        RECT ownerRect{};
+        if (owner)
+            GetWindowRect(owner, &ownerRect);
+        else
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &ownerRect, 0);
+        const int width = 460;
+        const int height = 266;
+        const int ownerW = ownerRect.right - ownerRect.left;
+        const int ownerH = ownerRect.bottom - ownerRect.top;
+        const int x = ownerRect.left + std::max(0, (ownerW - width) / 2);
+        const int y = ownerRect.top + std::max(0, (ownerH - height) / 2);
+
+        HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE, className, L"Texture Import Options",
+            WS_CAPTION | WS_SYSMENU | WS_POPUP,
+            x, y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &dlg);
+        if (!hwnd)
+            return false;
+
+        EnableWindow(owner, FALSE);
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+
+        MSG msg{};
+        while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0)
+        {
+            if (!IsDialogMessageW(hwnd, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+
+        options = dlg.options;
+        return options.accepted;
     }
 
     bool ImportPngToTexture(HWND owner, const TextureInfo& info, fs::path& importedPath, fs::path& backupPath, std::wstring& error)
@@ -4362,6 +5149,24 @@ namespace
 
         if (!BrowseOpenPng(owner, importedPath))
             return false;
+
+        TextureImportOptions importOptions;
+        if (info.kind == TextureAssetKind::WallTextureSet)
+        {
+            if (!ShowTextureImportOptions(owner, importOptions))
+                return false;
+        }
+        else
+        {
+            // Floor/roof flats use a fixed Amiga-safe import path. The normal
+            // wall import options (quantize palette, preprocess, dither) must
+            // not be applied here because they alter the original flat palette
+            // banks and can make the real Amiga loader/render path unstable.
+            importOptions.colorMode = TextureImportColorMode::Original;
+            importOptions.preprocess = TextureImportPreprocess::Off;
+            importOptions.dither = TextureImportDither::NoDither;
+            importOptions.accepted = true;
+        }
 
         std::vector<RgbColor> pixels;
         std::vector<std::uint8_t> alpha;
@@ -4394,26 +5199,48 @@ namespace
 
             if (!LoadPngForWallTexture(owner, importedPath, textureCount, 64, textureCount * 64, pixels, alpha, error))
                 return false;
-            QuantizeColorsReservedZero(pixels, alpha, static_cast<int>(storedEntries) + 1, palette, indexed);
+            NormalizeTextureTransparencyKeyPixels(pixels, alpha);
+            ApplyTextureImportPreprocess(pixels, alpha, importOptions.preprocess);
+            NormalizeTextureTransparencyKeyPixels(pixels, alpha);
+            int targetColors = static_cast<int>(storedEntries) + 1;
+            if (importOptions.colorMode == TextureImportColorMode::Force16)
+                targetColors = 16;
+            else if (importOptions.colorMode == TextureImportColorMode::Force32)
+                targetColors = 32;
+            else if (importOptions.colorMode == TextureImportColorMode::Force64)
+                targetColors = 64;
+            targetColors = std::clamp(targetColors, 2, 256);
+            const std::uint16_t newStoredEntries = static_cast<std::uint16_t>(targetColors - 1);
+            QuantizeColorsReservedZero(pixels, alpha, 64, textureCount * 64, targetColors, importOptions.dither, palette, indexed);
 
             const std::uint32_t newPaletteOffset = static_cast<std::uint32_t>(4 + columns * 65);
-            out.assign(static_cast<size_t>(newPaletteOffset) + 2U + static_cast<size_t>(storedEntries) * 2U, 0);
+            out.assign(static_cast<size_t>(newPaletteOffset) + 2U + static_cast<size_t>(newStoredEntries) * 2U, 0);
             WriteBE32(out, 0, newPaletteOffset);
             for (int column = 0; column < columns; ++column)
             {
                 const size_t srcBase = 4U + static_cast<size_t>(column) * 65U;
                 const size_t dstBase = 4U + static_cast<size_t>(column) * 65U;
-                out[dstBase] = (srcBase < raw.size()) ? raw[srcBase] : 0;
                 const int tile = column / 64;
                 const int x = column % 64;
+                bool columnHasIndexZero = false;
                 for (int y = 0; y < 64; ++y)
                 {
                     const size_t pi = static_cast<size_t>(tile * 64 + y) * 64U + static_cast<size_t>(x);
-                    out[dstBase + 1U + static_cast<size_t>(y)] = (pi < indexed.size()) ? indexed[pi] : 0;
+                    std::uint8_t index = (pi < indexed.size()) ? indexed[pi] : 0;
+                    if (pi < pixels.size() && ShouldForceTextureIndexZero(pixels, alpha, pi, true))
+                        index = 0;
+                    if (index == 0)
+                        columnHasIndexZero = true;
+                    out[dstBase + 1U + static_cast<size_t>(y)] = index;
                 }
+                // The byte before each 64-pixel column is not color data. It is
+                // used by the original renderer as a fast per-column transparent
+                // marker. Copying it from the previous texture keeps old opaque
+                // columns opaque even if the imported pixels now contain index 0.
+                out[dstBase] = columnHasIndexZero ? 0xFF : 0x00;
             }
-            WriteBE16(out, newPaletteOffset, storedEntries);
-            for (int i = 0; i < static_cast<int>(storedEntries); ++i)
+            WriteBE16(out, newPaletteOffset, newStoredEntries);
+            for (int i = 0; i < static_cast<int>(newStoredEntries); ++i)
             {
                 const RgbColor c = (i + 1 < static_cast<int>(palette.size())) ? palette[static_cast<size_t>(i + 1)] : RgbColor{};
                 WriteBE16(out, static_cast<size_t>(newPaletteOffset) + 2U + static_cast<size_t>(i) * 2U, EncodeAmiga12(c));
@@ -4421,29 +5248,68 @@ namespace
         }
         else if (info.kind == TextureAssetKind::FlatTexture)
         {
-            if (raw.size() < 128U * 128U + 2U)
+            if (raw.size() < kAmigaFlatPixelBytes + 2U || ((raw.size() - kAmigaFlatPixelBytes) % 2U) != 0)
             {
-                error = L"Flat texture data is too small.";
+                error = L"Invalid floor/roof texture format.";
                 return false;
             }
-            const int entries = std::max<int>(1, static_cast<int>((raw.size() - 128U * 128U) / 2U));
-            if (!LoadPngScaled(owner, importedPath, 128, 128, pixels, alpha, error))
-                return false;
-            QuantizeColors(pixels, entries, palette, indexed);
 
-            out.assign(128U * 128U + static_cast<size_t>(entries) * 2U, 0);
-            for (int y = 0; y < 128; ++y)
+            std::vector<std::uint8_t> flatPaletteBytes;
+            if (!LoadAmigaFlatPaletteReference(info.file, raw, flatPaletteBytes, palette))
             {
-                for (int x = 0; x < 128; ++x)
+                error = L"Could not load a usable Amiga floor/roof palette.";
+                return false;
+            }
+
+            if (palette.size() < 2U || palette.size() > 64U)
+            {
+                error = L"Invalid floor/roof palette size.";
+                return false;
+            }
+
+            if (!LoadPngScaled(owner, importedPath, static_cast<int>(kAmigaFlatWidth), static_cast<int>(kAmigaFlatHeight), pixels, alpha, error))
+                return false;
+
+            // Confirmed-safe flat path on real Amiga:
+            // - never generate a new low-index floor/roof palette
+            // - use the original/backup 64-slot flat palette/light-bank layout
+            // - if the current file is already editor-damaged, recover from a
+            //   valid backup or finally from the built-in Gloom flat palette
+            // - write raw/uncompressed 128x128 indexed pixels + palette block
+            auto nearestExistingFlatIndex = [&](const RgbColor& c) -> std::uint8_t
+            {
+                int best = 1; // keep index 0 unused for Amiga floor/roof safety
+                int bestDist = INT_MAX;
+                for (int idx = 1; idx < static_cast<int>(palette.size()); ++idx)
                 {
-                    out[static_cast<size_t>(y) + static_cast<size_t>(x) * 128U] = indexed[static_cast<size_t>(y) * 128U + static_cast<size_t>(x)];
+                    const RgbColor& p = palette[static_cast<size_t>(idx)];
+                    const int dr = static_cast<int>(c.r) - static_cast<int>(p.r);
+                    const int dg = static_cast<int>(c.g) - static_cast<int>(p.g);
+                    const int db = static_cast<int>(c.b) - static_cast<int>(p.b);
+                    const int dist = dr * dr + dg * dg + db * db;
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        best = idx;
+                        if (dist == 0)
+                            break;
+                    }
+                }
+                return static_cast<std::uint8_t>(best);
+            };
+
+            out.assign(kAmigaFlatPixelBytes + flatPaletteBytes.size(), 0);
+            for (int y = 0; y < static_cast<int>(kAmigaFlatHeight); ++y)
+            {
+                for (int x = 0; x < static_cast<int>(kAmigaFlatWidth); ++x)
+                {
+                    const size_t src = static_cast<size_t>(y) * kAmigaFlatWidth + static_cast<size_t>(x);
+                    const size_t dst = static_cast<size_t>(y) + static_cast<size_t>(x) * kAmigaFlatHeight;
+                    out[dst] = nearestExistingFlatIndex(pixels[src]);
                 }
             }
-            for (int i = 0; i < entries; ++i)
-            {
-                const RgbColor c = (i < static_cast<int>(palette.size())) ? palette[static_cast<size_t>(i)] : RgbColor{};
-                WriteBE16(out, 128U * 128U + static_cast<size_t>(i) * 2U, EncodeAmiga12(c));
-            }
+
+            std::copy(flatPaletteBytes.begin(), flatPaletteBytes.end(), out.begin() + static_cast<std::ptrdiff_t>(kAmigaFlatPixelBytes));
         }
         else
         {
@@ -4488,6 +5354,32 @@ namespace
         }
     }
 
+    std::wstring TextureVerificationSummary(const TextureInfo& info)
+    {
+        std::wstringstream s;
+        if (info.colors > 0)
+        {
+            s << L"Palette colors stored: " << info.colors;
+            if (info.kind == TextureAssetKind::WallTextureSet && info.paletteStorageValue >= 0)
+                s << L" (file word " << info.paletteStorageValue << L" + implicit index 0)";
+            s << L"\n";
+        }
+        if (info.uniquePaletteColors > 0)
+            s << L"Unique visible palette colors after Amiga RGB12: " << info.uniquePaletteColors << L"\n";
+        if (info.usedVisibleColors > 0)
+            s << L"Used visible colors after Amiga RGB12: " << info.usedVisibleColors << L"\n";
+        if (info.usedColorIndexes > 0)
+        {
+            s << L"Used color indexes: " << info.usedColorIndexes;
+            if (info.minUsedColorIndex >= 0 && info.maxUsedColorIndex >= 0)
+                s << L" (" << info.minUsedColorIndex << L"-" << info.maxUsedColorIndex << L")";
+            s << L"\n";
+        }
+        if (info.outOfPaletteIndexes > 0)
+            s << L"Warning: " << info.outOfPaletteIndexes << L" texture pixels reference indexes outside the palette.\n";
+        return s.str();
+    }
+
     std::wstring TextureInfoText(const TextureInfo& info)
     {
         std::wstringstream s;
@@ -4507,11 +5399,29 @@ namespace
             s << L"64x64 textures: " << info.wallTextureCount << L"\n";
         }
         if (info.colors > 0)
+        {
             s << L"Palette entries/colors: " << info.colors << L"\n";
+            if (info.kind == TextureAssetKind::WallTextureSet && info.paletteStorageValue >= 0)
+                s << L"Palette storage word: " << info.paletteStorageValue << L" (means " << info.colors << L" color slots incl. implicit index 0)\n";
+        }
+        if (info.uniquePaletteColors > 0)
+            s << L"Unique visible palette colors after Amiga RGB12: " << info.uniquePaletteColors << L"\n";
+        if (info.usedVisibleColors > 0)
+            s << L"Used visible colors after Amiga RGB12: " << info.usedVisibleColors << L"\n";
+        if (info.usedColorIndexes > 0)
+        {
+            s << L"Used color indexes: " << info.usedColorIndexes;
+            if (info.minUsedColorIndex >= 0 && info.maxUsedColorIndex >= 0)
+                s << L" (" << info.minUsedColorIndex << L"-" << info.maxUsedColorIndex << L")";
+            s << L"\n";
+        }
+        if (info.outOfPaletteIndexes > 0)
+            s << L"Out-of-palette pixels: " << info.outOfPaletteIndexes << L"\n";
         if (!info.error.empty())
             s << L"\nWarning: " << info.error << L"\n";
         s << L"\nRead path: CrM2 decrypt -> native Gloom texture decoder -> preview/export.\n";
         s << L"Import path: PNG -> indexed Gloom texture -> raw/uncompressed file.\n";
+        s << L"Texture palettes are stored as Amiga RGB12; very close PNG colors can collapse to the same visible color.\n";
         s << L"CrM2 repacking is disabled; imports are written uncompressed.";
         return s.str();
     }
@@ -4804,7 +5714,7 @@ namespace
         dlg->previewWheelRemainder = 0;
         UpdateTexturePreviewScroll(dlg);
         EnableWindow(dlg->exportPng, dlg->previewBitmap != nullptr);
-        EnableWindow(dlg->importPng, info.kind == TextureAssetKind::WallTextureSet || info.kind == TextureAssetKind::FlatTexture);
+        EnableWindow(dlg->importPng, (info.kind == TextureAssetKind::WallTextureSet || info.kind == TextureAssetKind::FlatTexture) ? TRUE : FALSE);
         InvalidateRect(dlg->hwnd, nullptr, TRUE);
     }
 
@@ -5076,13 +5986,17 @@ namespace
                         TextureInfo current = dlg->textures[static_cast<size_t>(dlg->selectedIndex)];
                         if (ImportPngToTexture(hwnd, current, imported, backup, error))
                         {
-                            dlg->textures[static_cast<size_t>(dlg->selectedIndex)] = AnalyzeTextureAsset(current.file);
+                            TextureInfo updated = AnalyzeTextureAsset(current.file);
+                            dlg->textures[static_cast<size_t>(dlg->selectedIndex)] = updated;
                             RefreshTextureManagerSelection(dlg);
                             std::wstring msg = L"PNG imported as raw/uncompressed texture.\n\n";
                             msg += L"Source PNG:\n" + imported.wstring() + L"\n\n";
                             msg += L"Backup:\n" + backup.wstring();
+                            const std::wstring verify = TextureVerificationSummary(updated);
+                            if (!verify.empty())
+                                msg += L"\n\nWritten texture check:\n" + verify;
                             if (current.isCrM2)
-                                msg += L"\n\nOriginal texture was CrM2 compressed. The imported file is intentionally written raw/uncompressed for compatibility testing.";
+                                msg += L"\nOriginal texture was CrM2 compressed. The imported file is intentionally written raw/uncompressed for compatibility testing.";
                             DarkMessageBox(hwnd, msg, L"Textures", MB_OK | MB_ICONINFORMATION);
                         }
                         else if (!error.empty())

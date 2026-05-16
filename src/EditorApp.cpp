@@ -22,7 +22,9 @@
 #include <cwctype>
 #include <cwchar>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -40,6 +42,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "msimg32.lib")
 
 namespace
 {
@@ -80,6 +83,9 @@ namespace
     constexpr UINT kCmdToolbarScrollUp = 65012; // local toolbar scroll command; keeps resource.h unchanged
     constexpr UINT kCmdToolbarScrollDown = 65013; // local toolbar scroll command; keeps resource.h unchanged
     constexpr UINT kCmdViewEventGraphOverlay = 65014; // local view toggle; keeps resource.h unchanged
+
+    constexpr const wchar_t* kEditorProductName = L"ZGLOOM Editor";
+    constexpr const wchar_t* kEditorVersionText = L"1.1.0";
 
     enum class InsertMode
     {
@@ -167,6 +173,7 @@ namespace
     {
         mapfmt::MapDocument document;
         int selectedZone = -1;
+        std::vector<uint8_t> validationIgnoreZones;
     };
 
     struct MonsterSpawnSelection
@@ -242,6 +249,9 @@ namespace
         std::wstring technical;
         std::wstring full;
         std::vector<int> safeNeutralGuideZones;
+        std::vector<int> safeClearTriggerlessEventSlots;
+        std::vector<int> safeRemoveAwayFacingBackfaces;
+        std::vector<int> safeFlipAwayFacingWalls;
         int okCount = 0;
         int infoCount = 0;
         int warnCount = 0;
@@ -249,7 +259,8 @@ namespace
 
         bool HasSafeRepairs() const
         {
-            return !safeNeutralGuideZones.empty();
+            return !safeNeutralGuideZones.empty() || !safeClearTriggerlessEventSlots.empty() ||
+                   !safeRemoveAwayFacingBackfaces.empty() || !safeFlipAwayFacingWalls.empty();
         }
 
         bool HasWarnings() const
@@ -325,6 +336,7 @@ namespace
         GameProfile gameProfile;
         bool showEventGraphOverlay = false;
         int selectedZone = -1;
+        std::vector<uint8_t> validationIgnoreZones;
         MonsterSpawnSelection selectedMonsterSpawn{};
         TeleportSelection selectedTeleportTarget{};
         int previewTextureBand = 0;
@@ -374,6 +386,7 @@ namespace
         InsertMode insertMode = InsertMode::None;
         bool isDrawing = false;
         bool isPanning = false;
+        bool allowFreeCanvasPan = false;
         bool monsterSpawnDragging = false;
         bool monsterSpawnDragMoved = false;
         bool monsterSpawnDragSnapshotTaken = false;
@@ -934,6 +947,11 @@ namespace
     void WalkPreviewDirectionVectors(int dir, double& fx, double& fz, double& rx, double& rz);
     void UpdateModeButtons();
     void RefreshZoneList();
+    void EnsureValidationIgnoreSize();
+    bool IsZoneValidationIgnored(int zoneIndex);
+    void RemoveValidationIgnoreIndex(int zoneIndex);
+    void SwapValidationIgnoreIndices(int a, int b);
+    bool ToggleSelectedWallValidationIgnore();
     void MarkDirty();
     void UpdateInfoPanelScrollBar(HWND hwnd);
     void UpdateCanvasScrollBars(HWND hwnd);
@@ -970,13 +988,22 @@ namespace
     void OrientWallForConnectedEndpoints(int zoneIndex);
     void ReverseWallDirectionPreservingTexture(mapfmt::Zone& zone);
     bool IsWallZone(const mapfmt::Zone& zone);
+    bool AreReverseWallPair(const mapfmt::Zone& a, const mapfmt::Zone& b);
     int FindReverseWallPairIndex(int zoneIndex);
     bool IsVisualBackfaceWallIndex(int zoneIndex);
     int GetCanonicalWallIndex(int zoneIndex);
     void NormalizeSelectedWallToCanonical();
     void NormalizeCollinearConnectedWallsAroundZone(int zoneIndex);
     void CleanupWallsForGameplaySave();
+    int AutoOrientWallSidesFromPlayerReachableArea();
+    std::vector<int> FindAwayFacingBackfaceRemovalCandidates();
+    std::vector<int> FindAwayFacingWallFlipCandidates();
+    int RemoveAwayFacingBackfaceWalls(const std::vector<int>& zoneIndices);
+    int FlipAwayFacingWalls(const std::vector<int>& zoneIndices);
+    bool FlipSelectedWallFacing();
+    void DrawWallFacingArrow(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, const mapfmt::Zone& zone, bool selected);
     void SyncBackfaceWallFromFront(int frontIndex, int backIndex);
+    void SyncExistingBackfaceWallFromFront(int frontIndex);
     void EnsureBackfaceForWallAtIndex(int zoneIndex);
     POINT WorldToScreen(const RECT& rc, const mapfmt::Bounds& bounds, int x, int z);
     POINT ScreenToWorldPrecise(const RECT& rc, const mapfmt::Bounds& bounds, int sx, int sy);
@@ -1417,6 +1444,15 @@ namespace
 
     void ClampViewCenterToDocument(const mapfmt::Bounds& rawBounds)
     {
+        if (g_app.isPanning || g_app.allowFreeCanvasPan)
+        {
+            // SPACE + mouse drag is a free canvas pan, not a scrollbar drag.
+            // Keep that free offset after releasing the mouse too; otherwise the
+            // next mouse-wheel zoom or scrollbar refresh snaps the view back to
+            // the closest scrollbar edge.
+            return;
+        }
+
         RECT rc{};
         if (g_app.canvas)
         {
@@ -1437,7 +1473,13 @@ namespace
 
         if (visibleWidth >= baseWidth)
         {
-            g_app.viewCenterX = (static_cast<double>(baseBounds.minX) + static_cast<double>(baseBounds.maxX)) * 0.5;
+            // Keep SPACE + mouse panning useful even when the whole map fits
+            // on screen and no horizontal scrollbar is visible.  The center may
+            // move across the aligned document range instead of being forced
+            // back to the middle on every mouse move.
+            g_app.viewCenterX = ClampValue(g_app.viewCenterX,
+                static_cast<double>(baseBounds.minX),
+                static_cast<double>(baseBounds.maxX));
         }
         else
         {
@@ -1448,7 +1490,10 @@ namespace
 
         if (visibleHeight >= baseHeight)
         {
-            g_app.viewCenterZ = (static_cast<double>(baseBounds.minZ) + static_cast<double>(baseBounds.maxZ)) * 0.5;
+            // Same for vertical panning: no scrollbar must not mean no drag.
+            g_app.viewCenterZ = ClampValue(g_app.viewCenterZ,
+                static_cast<double>(baseBounds.minZ),
+                static_cast<double>(baseBounds.maxZ));
         }
         else
         {
@@ -1481,6 +1526,7 @@ namespace
         g_app.canvasZoom = 1.0;
         g_app.viewCenterX = (static_cast<double>(baseBounds.minX) + static_cast<double>(baseBounds.maxX)) * 0.5;
         g_app.viewCenterZ = (static_cast<double>(baseBounds.minZ) + static_cast<double>(baseBounds.maxZ)) * 0.5;
+        g_app.allowFreeCanvasPan = false;
         g_app.viewInitialized = true;
         ClampViewCenterToDocument(rawBounds);
         UpdateCanvasScrollBars(g_app.canvas);
@@ -1501,29 +1547,36 @@ namespace
         double centerZ = g_app.viewInitialized ? g_app.viewCenterZ :
             (static_cast<double>(metrics.baseBounds.minZ) + static_cast<double>(metrics.baseBounds.maxZ)) * 0.5;
 
-        const double baseWidth = MaxValue(1.0, static_cast<double>(metrics.baseBounds.maxX - metrics.baseBounds.minX));
-        const double baseHeight = MaxValue(1.0, static_cast<double>(metrics.baseBounds.maxZ - metrics.baseBounds.minZ));
+        if (!g_app.viewInitialized)
+        {
+            const double baseWidth = MaxValue(1.0, static_cast<double>(metrics.baseBounds.maxX - metrics.baseBounds.minX));
+            const double baseHeight = MaxValue(1.0, static_cast<double>(metrics.baseBounds.maxZ - metrics.baseBounds.minZ));
 
-        if (metrics.visibleWorldWidth < baseWidth)
-        {
-            const double minCenterX = static_cast<double>(metrics.baseBounds.minX) + metrics.visibleWorldWidth * 0.5;
-            const double maxCenterX = static_cast<double>(metrics.baseBounds.maxX) - metrics.visibleWorldWidth * 0.5;
-            centerX = ClampValue(centerX, minCenterX, maxCenterX);
-        }
-        else
-        {
-            centerX = (static_cast<double>(metrics.baseBounds.minX) + static_cast<double>(metrics.baseBounds.maxX)) * 0.5;
-        }
+            if (metrics.visibleWorldWidth < baseWidth)
+            {
+                const double minCenterX = static_cast<double>(metrics.baseBounds.minX) + metrics.visibleWorldWidth * 0.5;
+                const double maxCenterX = static_cast<double>(metrics.baseBounds.maxX) - metrics.visibleWorldWidth * 0.5;
+                centerX = ClampValue(centerX, minCenterX, maxCenterX);
+            }
+            else
+            {
+                centerX = ClampValue(centerX,
+                    static_cast<double>(metrics.baseBounds.minX),
+                    static_cast<double>(metrics.baseBounds.maxX));
+            }
 
-        if (metrics.visibleWorldHeight < baseHeight)
-        {
-            const double minCenterZ = static_cast<double>(metrics.baseBounds.minZ) + metrics.visibleWorldHeight * 0.5;
-            const double maxCenterZ = static_cast<double>(metrics.baseBounds.maxZ) - metrics.visibleWorldHeight * 0.5;
-            centerZ = ClampValue(centerZ, minCenterZ, maxCenterZ);
-        }
-        else
-        {
-            centerZ = (static_cast<double>(metrics.baseBounds.minZ) + static_cast<double>(metrics.baseBounds.maxZ)) * 0.5;
+            if (metrics.visibleWorldHeight < baseHeight)
+            {
+                const double minCenterZ = static_cast<double>(metrics.baseBounds.minZ) + metrics.visibleWorldHeight * 0.5;
+                const double maxCenterZ = static_cast<double>(metrics.baseBounds.maxZ) - metrics.visibleWorldHeight * 0.5;
+                centerZ = ClampValue(centerZ, minCenterZ, maxCenterZ);
+            }
+            else
+            {
+                centerZ = ClampValue(centerZ,
+                    static_cast<double>(metrics.baseBounds.minZ),
+                    static_cast<double>(metrics.baseBounds.maxZ));
+            }
         }
 
         metrics.centerWorldX = centerX;
@@ -2139,9 +2192,14 @@ namespace
 
         std::string floorName;
         std::string ceilingName;
+        std::vector<int> ignoredZones;
         std::string line;
         while (std::getline(file, line))
         {
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
             if (line.rfind("FloorTexture=", 0) == 0)
             {
                 floorName = line.substr(13);
@@ -2149,6 +2207,31 @@ namespace
             else if (line.rfind("CeilingTexture=", 0) == 0)
             {
                 ceilingName = line.substr(15);
+            }
+            else if (line.rfind("ValidationIgnore=", 0) == 0)
+            {
+                const std::string list = line.substr(17);
+                size_t pos = 0;
+                while (pos <= list.size())
+                {
+                    const size_t comma = list.find(',', pos);
+                    const size_t tokenEnd = comma == std::string::npos ? list.size() : comma;
+                    const std::string token = list.substr(pos, tokenEnd - pos);
+                    if (!token.empty())
+                    {
+                        char* tail = nullptr;
+                        const long value = std::strtol(token.c_str(), &tail, 10);
+                        if (tail != token.c_str() && value >= 0 && value <= std::numeric_limits<int>::max())
+                        {
+                            ignoredZones.push_back(static_cast<int>(value));
+                        }
+                    }
+                    if (comma == std::string::npos)
+                    {
+                        break;
+                    }
+                    pos = comma + 1;
+                }
             }
         }
 
@@ -2183,6 +2266,21 @@ namespace
                 changed = true;
             }
         }
+
+        EnsureValidationIgnoreSize();
+        if (!ignoredZones.empty())
+        {
+            std::fill(g_app.validationIgnoreZones.begin(), g_app.validationIgnoreZones.end(), 0);
+            for (int zoneIndex : ignoredZones)
+            {
+                if (zoneIndex >= 0 && zoneIndex < static_cast<int>(g_app.validationIgnoreZones.size()) &&
+                    IsWallZone(g_app.document.zones[static_cast<size_t>(zoneIndex)]))
+                {
+                    g_app.validationIgnoreZones[static_cast<size_t>(zoneIndex)] = 1;
+                    changed = true;
+                }
+            }
+        }
         return changed;
     }
 
@@ -2201,6 +2299,29 @@ namespace
         file << "ZGloomEditorMeta=1\n";
         file << "FloorTexture=" << GetSurfaceTextureNameFor(SurfaceTextureTarget::Floor) << "\n";
         file << "CeilingTexture=" << GetSurfaceTextureNameFor(SurfaceTextureTarget::Ceiling) << "\n";
+
+        EnsureValidationIgnoreSize();
+        file << "ValidationIgnore=";
+        bool first = true;
+        for (int i = 0; i < static_cast<int>(g_app.validationIgnoreZones.size()); ++i)
+        {
+            if (g_app.validationIgnoreZones[static_cast<size_t>(i)] == 0)
+            {
+                continue;
+            }
+            if (i >= static_cast<int>(g_app.document.zones.size()) || !IsWallZone(g_app.document.zones[static_cast<size_t>(i)]))
+            {
+                continue;
+            }
+            if (!first)
+            {
+                file << ',';
+            }
+            file << i;
+            first = false;
+        }
+        file << "\n";
+
         if (!file)
         {
             errorMessage = "Failed while writing surface texture metadata file: " + metaPath;
@@ -2242,48 +2363,6 @@ namespace
         strip = ClampValue(strip, 0, 19);
         return static_cast<uint8_t>(slot * 20 + strip);
     }
-
-    std::string NormalizeTextureNameForAnimLookup(std::string name)
-    {
-        std::replace(name.begin(), name.end(), '\\', '/');
-        const size_t slash = name.find_last_of('/');
-        if (slash != std::string::npos)
-        {
-            name.erase(0, slash + 1);
-        }
-        const size_t dot = name.find_last_of('.');
-        if (dot != std::string::npos)
-        {
-            name.erase(dot);
-        }
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch)
-        {
-            return static_cast<char>(std::tolower(ch));
-        });
-        return name;
-    }
-
-    bool TextureSlotNameMatches(int slot, const char* expected)
-    {
-        slot = ClampValue(slot, 0, static_cast<int>(mapfmt::MapDocument::kTextureSlotCount) - 1);
-        return NormalizeTextureNameForAnimLookup(g_app.document.textureNames[slot]) == expected;
-    }
-
-    struct KnownTextureAnimation
-    {
-        const char* textureName;
-        int firstSectionOneBased;
-        int frames;
-    };
-
-    const std::array<KnownTextureAnimation, 3> kKnownTextureAnimations = {{
-        // Gloom's common animated wall bands are not always present in every
-        // map's animation block. The editor therefore knows the common texture
-        // file/section ranges and injects the missing animation entry on use.
-        { "txt1_1", 11, 4 },
-        { "txt1_3", 11, 4 },
-        { "txt1_2", 16, 4 },
-    }};
 
     struct SmartTextureAnimationCacheEntry
     {
@@ -2510,48 +2589,14 @@ namespace
         UNREFERENCED_PARAMETER(textureIndex);
         UNREFERENCED_PARAMETER(outAnimation);
         // Disabled on purpose: visual auto-detection was too unreliable for
-        // Gloom's wall strips. Animations are now either explicit map entries,
-        // the small known compatibility table below, or user-marked ranges in
-        // the Texture Slots dialog.
-        return false;
-    }
-
-    bool ResolveKnownTextureAnimation(int textureIndex, mapfmt::AnimationEntry& outAnimation)
-    {
-        textureIndex = ClampValue(textureIndex, 0, 159);
-        const int slot = textureIndex / 20;
-        const int strip = textureIndex % 20;
-        for (const auto& known : kKnownTextureAnimations)
-        {
-            if (!TextureSlotNameMatches(slot, known.textureName))
-            {
-                continue;
-            }
-            const int firstStrip = ClampValue(known.firstSectionOneBased - 1, 0, 19);
-            const int lastStripExclusive = firstStrip + MaxValue(1, known.frames);
-            if (strip >= firstStrip && strip < lastStripExclusive)
-            {
-                outAnimation.frames = static_cast<uint16_t>(MaxValue(1, known.frames));
-                outAnimation.first = static_cast<uint16_t>(slot * 20 + firstStrip);
-                outAnimation.delay = 4;
-                outAnimation.current = 0;
-                return true;
-            }
-        }
+        // Gloom's wall strips. Animations are now either explicit map entries
+        // or user-marked ranges in the Texture Slots dialog.
         return false;
     }
 
     bool ResolveAnimationForTextureIndex(int textureIndex, mapfmt::AnimationEntry& outAnimation)
     {
         textureIndex = ClampValue(textureIndex, 0, 159);
-        // Prefer explicit texture-name knowledge for the Gloom texture bands.
-        // Some maps either omit these entries or use section numbering that is
-        // easy to misread in an editor. The known table keeps txt1_1 section
-        // 11..14 anchored to section 11 even when a loaded table is ambiguous.
-        if (ResolveKnownTextureAnimation(textureIndex, outAnimation))
-        {
-            return true;
-        }
         for (const auto& anim : g_app.document.animations)
         {
             if (anim.Contains(textureIndex))
@@ -2560,29 +2605,11 @@ namespace
                 return true;
             }
         }
-        // Manual animation ranges set in the Texture Slots dialog are stored in
-        // document.animations above. Do not auto-detect here: the visual heuristic
-        // was too risky and could group unrelated wall/window panels.
+        // Important: do not infer animations from known texture names here.
+        // Texture Slot edits must be authoritative: when the user unticks a
+        // preview animation range, the inspector and saver must treat the
+        // texture as static unless an explicit map animation entry remains.
         return false;
-    }
-
-    uint16_t GuessAnimationDelayForEntry(const mapfmt::AnimationEntry& wanted)
-    {
-        for (const auto& anim : g_app.document.animations)
-        {
-            if (anim.frames == wanted.frames && anim.delay > 0)
-            {
-                return anim.delay;
-            }
-        }
-        for (const auto& anim : g_app.document.animations)
-        {
-            if (anim.delay > 0)
-            {
-                return anim.delay;
-            }
-        }
-        return 4;
     }
 
     void AppendBE16(std::vector<uint8_t>& out, uint16_t value)
@@ -2634,24 +2661,11 @@ namespace
             }
         }
 
-        mapfmt::AnimationEntry resolved{};
-        if (!ResolveKnownTextureAnimation(textureIndex, resolved))
-        {
-            // Static or manually configured texture: manual entries are already
-            // present in document.animations, so no heuristic injection here.
-            return false;
-        }
-        for (const auto& anim : g_app.document.animations)
-        {
-            if (anim.first == resolved.first && anim.frames == resolved.frames)
-            {
-                return false;
-            }
-        }
-        resolved.delay = GuessAnimationDelayForEntry(resolved);
-        g_app.document.animations.push_back(resolved);
-        RebuildAnimationBlockFromDocumentAnimations();
-        return true;
+        // Older builds auto-created animation entries for a few hard-coded
+        // texture-name ranges. That made removed preview animations come back
+        // immediately in the inspector and on save. New animations now only come
+        // from the Texture Slots dialog / loaded map data.
+        return false;
     }
 
     int NormalizeStripToAnimationStart(int slot, int strip)
@@ -4608,7 +4622,7 @@ namespace
         return eventIndex;
     }
 
-    bool ZoneUsesKnownAnimatedTexture(const mapfmt::Zone& zone, mapfmt::AnimationEntry& outAnimation)
+    bool ZoneUsesAnimatedTexture(const mapfmt::Zone& zone, mapfmt::AnimationEntry& outAnimation)
     {
         for (uint8_t texture : zone.textures)
         {
@@ -4622,7 +4636,7 @@ namespace
         return false;
     }
 
-    bool ActiveWallTextureIsKnownAnimated(mapfmt::AnimationEntry& outAnimation)
+    bool ActiveWallTextureIsAnimated(mapfmt::AnimationEntry& outAnimation)
     {
         return ResolveAnimationForTextureIndex(GetActiveWallTextureIndex(), outAnimation);
     }
@@ -4649,11 +4663,11 @@ namespace
         }
 
         mapfmt::AnimationEntry anim{};
-        bool hasDoorLikeAnimatedTexture = ZoneUsesKnownAnimatedTexture(zone, anim);
-        if (!hasDoorLikeAnimatedTexture && allowActiveTextureConvenience && ActiveWallTextureIsKnownAnimated(anim))
+        bool hasDoorLikeAnimatedTexture = ZoneUsesAnimatedTexture(zone, anim);
+        if (!hasDoorLikeAnimatedTexture && allowActiveTextureConvenience && ActiveWallTextureIsAnimated(anim))
         {
-            // Optional convenience only: if the user explicitly selected a
-            // known animated band such as txt1_3 section 11..14 before linking,
+            // Optional convenience only: if the user selected an explicit
+            // animated band such as txt1_3 section 11..14 before linking,
             // apply that animation's first frame.  If not, leave the target's
             // normal wall texture untouched and it will still be event-driven.
             const int first = ClampValue(static_cast<int>(anim.first), 0, 159);
@@ -4971,27 +4985,43 @@ namespace
         if (targetZoneIndex < 0 || targetZoneIndex >= static_cast<int>(g_app.document.zones.size())) return false;
         newTextureIndex = ClampValue(newTextureIndex, 0, 159);
 
-        mapfmt::EventCommand switchCommand;
-        switchCommand.type = mapfmt::CommandType::ChangeTexture;
-        switchCommand.params[0] = static_cast<int16_t>(targetZoneIndex);
-        switchCommand.params[1] = static_cast<int16_t>(newTextureIndex);
+        std::vector<int> targetZoneIndexes;
+        targetZoneIndexes.reserve(2);
+        AddUniqueIndex(targetZoneIndexes, targetZoneIndex);
+        const int reversePairIndex = FindReverseWallPairIndex(targetZoneIndex);
+        if (reversePairIndex >= 0)
+        {
+            AddUniqueIndex(targetZoneIndexes, reversePairIndex);
+        }
+
+        std::vector<mapfmt::EventCommand> switchCommands;
+        switchCommands.reserve(targetZoneIndexes.size());
+        for (int switchTargetZoneIndex : targetZoneIndexes)
+        {
+            mapfmt::EventCommand switchCommand;
+            switchCommand.type = mapfmt::CommandType::ChangeTexture;
+            switchCommand.params[0] = static_cast<int16_t>(switchTargetZoneIndex);
+            switchCommand.params[1] = static_cast<int16_t>(newTextureIndex);
+            switchCommands.push_back(switchCommand);
+        }
 
         std::vector<mapfmt::EventCommand> rebuilt;
-        rebuilt.reserve(commands.size() + 1);
+        rebuilt.reserve(commands.size() + switchCommands.size());
         for (const auto& command : commands)
         {
             if (ChangeTextureCommandTargetsSameDisplayedWall(command, targetZoneIndex))
             {
                 // Drop old OFF-frame entries such as ChangeTexture Z76 -> 37,
-                // and also collapse duplicate front/back/display-equivalent
-                // switch commands into the one exact raw target clicked by user.
+                // and collapse stale front/back/display-equivalent switch commands.
+                // Gloom/ZGloom applies ChangeTexture only to zone.t[0] of the exact
+                // raw zone, so two-sided switch walls must write both faces.
                 continue;
             }
             rebuilt.push_back(command);
         }
 
         auto insertIt = std::find_if(rebuilt.begin(), rebuilt.end(), IsSwitchTextureMoverCommand);
-        rebuilt.insert(insertIt, switchCommand);
+        rebuilt.insert(insertIt, switchCommands.begin(), switchCommands.end());
 
         if (SameEventCommands(commands, rebuilt))
         {
@@ -5555,6 +5585,1278 @@ namespace
         return zoneIndex >= 0 &&
                zoneIndex < static_cast<int>(guideMask.size()) &&
                guideMask[static_cast<size_t>(zoneIndex)] != 0;
+    }
+
+    bool LooksLikeNeutralMoveWallGuideForOrientation(const mapfmt::Zone& zone)
+    {
+        return zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+               zone.a == 0 && zone.b == 0 && zone.na == 0 && zone.nb == 0 &&
+               zone.ln == 0 && zone.sc == 0 && zone.ev == 0 &&
+               std::all_of(zone.textures.begin(), zone.textures.end(), [](uint8_t t) { return t == 0; });
+    }
+
+    bool GetWallPlayerFacingUnitNormal(const mapfmt::Zone& zone, double& outX, double& outZ)
+    {
+        // In the original maps the gameplay/player-visible side is the negative
+        // side of the stored (a,b) wall-side vector.  This is the side we show in
+        // the editor as the small wall-facing arrow and the side we try to keep
+        // inside the player-reachable area during save.
+        double nx = -static_cast<double>(zone.a);
+        double nz = -static_cast<double>(zone.b);
+        double len = std::hypot(nx, nz);
+        if (len < 1.0)
+        {
+            const double dx = static_cast<double>(zone.x2) - static_cast<double>(zone.x1);
+            const double dz = static_cast<double>(zone.z2) - static_cast<double>(zone.z1);
+            len = std::hypot(dx, dz);
+            if (len < 1.0)
+            {
+                return false;
+            }
+            nx = dz;
+            nz = -dx;
+            len = std::hypot(nx, nz);
+            if (len < 1.0)
+            {
+                return false;
+            }
+        }
+        outX = nx / len;
+        outZ = nz / len;
+        return true;
+    }
+
+    int WorldToReachabilityCell(double value)
+    {
+        return static_cast<int>(std::floor(value / static_cast<double>(kGridStep)));
+    }
+
+    bool IsReachabilityCellInRange(int x, int z)
+    {
+        return x >= 0 && x < mapfmt::MapDocument::kGridSize &&
+               z >= 0 && z < mapfmt::MapDocument::kGridSize;
+    }
+
+    double Orientation2D(double ax, double az, double bx, double bz, double cx, double cz)
+    {
+        return (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
+    }
+
+    bool ValueBetweenInclusive(double value, double a, double b)
+    {
+        constexpr double eps = 0.001;
+        return value >= std::min(a, b) - eps && value <= std::max(a, b) + eps;
+    }
+
+    bool SegmentsIntersectInclusive(double ax, double az, double bx, double bz,
+        double cx, double cz, double dx, double dz)
+    {
+        constexpr double eps = 0.001;
+        const double o1 = Orientation2D(ax, az, bx, bz, cx, cz);
+        const double o2 = Orientation2D(ax, az, bx, bz, dx, dz);
+        const double o3 = Orientation2D(cx, cz, dx, dz, ax, az);
+        const double o4 = Orientation2D(cx, cz, dx, dz, bx, bz);
+
+        if (((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps)) &&
+            ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps)))
+        {
+            return true;
+        }
+
+        if (std::abs(o1) <= eps && ValueBetweenInclusive(cx, ax, bx) && ValueBetweenInclusive(cz, az, bz)) return true;
+        if (std::abs(o2) <= eps && ValueBetweenInclusive(dx, ax, bx) && ValueBetweenInclusive(dz, az, bz)) return true;
+        if (std::abs(o3) <= eps && ValueBetweenInclusive(ax, cx, dx) && ValueBetweenInclusive(az, cz, dz)) return true;
+        if (std::abs(o4) <= eps && ValueBetweenInclusive(bx, cx, dx) && ValueBetweenInclusive(bz, cz, dz)) return true;
+        return false;
+    }
+
+    POINT ReachabilityCellCenter(int x, int z)
+    {
+        return POINT{ static_cast<LONG>(x * kGridStep + kGridStep / 2),
+                      static_cast<LONG>(z * kGridStep + kGridStep / 2) };
+    }
+
+    bool CellStepBlockedByWall(int fromX, int fromZ, int toX, int toZ,
+        const std::vector<int>& blockerWalls)
+    {
+        const POINT a = ReachabilityCellCenter(fromX, fromZ);
+        const POINT b = ReachabilityCellCenter(toX, toZ);
+        for (int wallIndex : blockerWalls)
+        {
+            if (wallIndex < 0 || wallIndex >= static_cast<int>(g_app.document.zones.size()))
+            {
+                continue;
+            }
+            const auto& wall = g_app.document.zones[static_cast<size_t>(wallIndex)];
+            if (!IsWallZone(wall) || LooksLikeNeutralMoveWallGuideForOrientation(wall))
+            {
+                continue;
+            }
+            if (SegmentsIntersectInclusive(
+                static_cast<double>(a.x), static_cast<double>(a.y),
+                static_cast<double>(b.x), static_cast<double>(b.y),
+                static_cast<double>(wall.x1), static_cast<double>(wall.z1),
+                static_cast<double>(wall.x2), static_cast<double>(wall.z2)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ReachableCellForWorldPoint(double x, double z,
+        const std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize>& reachable)
+    {
+        const int cx = WorldToReachabilityCell(x);
+        const int cz = WorldToReachabilityCell(z);
+        if (!IsReachabilityCellInRange(cx, cz))
+        {
+            return false;
+        }
+        return reachable[static_cast<size_t>(cx)][static_cast<size_t>(cz)] != 0;
+    }
+
+    int AutoOrientWallSidesFromPlayerReachableArea()
+    {
+        const mapfmt::EventCommand* playerStart = FindPlayerStartCommandConst(kPlayer1ObjectType);
+        if (!playerStart)
+        {
+            return 0;
+        }
+
+        const int startX = WorldToReachabilityCell(static_cast<double>(playerStart->params[1]));
+        const int startZ = WorldToReachabilityCell(static_cast<double>(playerStart->params[3]));
+        if (!IsReachabilityCellInRange(startX, startZ))
+        {
+            return 0;
+        }
+
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        std::vector<int> blockerWalls;
+        blockerWalls.reserve(g_app.document.zones.size());
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            const auto& zone = g_app.document.zones[static_cast<size_t>(i)];
+            if (!IsWallZone(zone) || IsVisualBackfaceWallIndex(i) ||
+                IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, i) ||
+                LooksLikeNeutralMoveWallGuideForOrientation(zone) ||
+                IsZoneControlledByOpenDoor(i))
+            {
+                continue;
+            }
+            blockerWalls.push_back(i);
+        }
+
+        std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize> reachable{};
+        std::vector<POINT> stack;
+        stack.push_back(POINT{ static_cast<LONG>(startX), static_cast<LONG>(startZ) });
+        reachable[static_cast<size_t>(startX)][static_cast<size_t>(startZ)] = 1;
+
+        const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        while (!stack.empty())
+        {
+            const POINT cell = stack.back();
+            stack.pop_back();
+            for (const auto& dir : dirs)
+            {
+                const int nx = static_cast<int>(cell.x) + dir[0];
+                const int nz = static_cast<int>(cell.y) + dir[1];
+                if (!IsReachabilityCellInRange(nx, nz) ||
+                    reachable[static_cast<size_t>(nx)][static_cast<size_t>(nz)] != 0)
+                {
+                    continue;
+                }
+                if (CellStepBlockedByWall(static_cast<int>(cell.x), static_cast<int>(cell.y), nx, nz, blockerWalls))
+                {
+                    continue;
+                }
+                reachable[static_cast<size_t>(nx)][static_cast<size_t>(nz)] = 1;
+                stack.push_back(POINT{ static_cast<LONG>(nx), static_cast<LONG>(nz) });
+            }
+        }
+
+        int changed = 0;
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            if (i >= static_cast<int>(g_app.document.zones.size()))
+            {
+                break;
+            }
+            auto& zone = g_app.document.zones[static_cast<size_t>(i)];
+            if (!IsWallZone(zone) || IsVisualBackfaceWallIndex(i) ||
+                IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, i) ||
+                LooksLikeNeutralMoveWallGuideForOrientation(zone))
+            {
+                continue;
+            }
+
+            if (zone.ln <= 0 || (zone.a == 0 && zone.b == 0))
+            {
+                mapfmt::RecalculateWallMetadata(zone);
+            }
+
+            double nx = 0.0;
+            double nz = 0.0;
+            if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+            {
+                continue;
+            }
+
+            const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+            const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+            constexpr double sampleOffset = 72.0;
+            const bool frontReachable = ReachableCellForWorldPoint(midX + nx * sampleOffset, midZ + nz * sampleOffset, reachable);
+            const bool backReachable = ReachableCellForWorldPoint(midX - nx * sampleOffset, midZ - nz * sampleOffset, reachable);
+
+            // Only auto-flip when the player-side decision is unambiguous. If the
+            // map is unfinished/open, both sides may be reachable; saving must
+            // still continue without changing the wall.
+            if (!frontReachable && backReachable)
+            {
+                ReverseWallDirectionPreservingTexture(zone);
+                UpdateWallTextureBandCountFromLength(zone);
+                const int backface = FindReverseWallPairIndex(i);
+                if (backface >= 0)
+                {
+                    SyncBackfaceWallFromFront(i, backface);
+                }
+                ++changed;
+            }
+        }
+
+        return changed;
+    }
+
+    bool BuildPlayerReachabilityMapForWallFacing(
+        std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize>& reachable)
+    {
+        reachable = {};
+
+        const mapfmt::EventCommand* playerStart = FindPlayerStartCommandConst(kPlayer1ObjectType);
+        if (!playerStart)
+        {
+            return false;
+        }
+
+        const int startX = WorldToReachabilityCell(static_cast<double>(playerStart->params[1]));
+        const int startZ = WorldToReachabilityCell(static_cast<double>(playerStart->params[3]));
+        if (!IsReachabilityCellInRange(startX, startZ))
+        {
+            return false;
+        }
+
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        std::vector<int> blockerWalls;
+        blockerWalls.reserve(g_app.document.zones.size());
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            const auto& zone = g_app.document.zones[static_cast<size_t>(i)];
+            if (!IsWallZone(zone) || IsVisualBackfaceWallIndex(i) ||
+                IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, i) ||
+                LooksLikeNeutralMoveWallGuideForOrientation(zone) ||
+                IsZoneControlledByOpenDoor(i))
+            {
+                continue;
+            }
+            blockerWalls.push_back(i);
+        }
+
+        std::vector<POINT> stack;
+        stack.push_back(POINT{ static_cast<LONG>(startX), static_cast<LONG>(startZ) });
+        reachable[static_cast<size_t>(startX)][static_cast<size_t>(startZ)] = 1;
+
+        const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        while (!stack.empty())
+        {
+            const POINT cell = stack.back();
+            stack.pop_back();
+            for (const auto& dir : dirs)
+            {
+                const int nx = static_cast<int>(cell.x) + dir[0];
+                const int nz = static_cast<int>(cell.y) + dir[1];
+                if (!IsReachabilityCellInRange(nx, nz) ||
+                    reachable[static_cast<size_t>(nx)][static_cast<size_t>(nz)] != 0)
+                {
+                    continue;
+                }
+                if (CellStepBlockedByWall(static_cast<int>(cell.x), static_cast<int>(cell.y), nx, nz, blockerWalls))
+                {
+                    continue;
+                }
+                reachable[static_cast<size_t>(nx)][static_cast<size_t>(nz)] = 1;
+                stack.push_back(POINT{ static_cast<LONG>(nx), static_cast<LONG>(nz) });
+            }
+        }
+
+        return true;
+    }
+
+    bool ZoneIsReferencedByAnyEventCommand(int zoneIndex)
+    {
+        if (zoneIndex < 0)
+        {
+            return false;
+        }
+
+        for (const auto& script : g_app.document.events)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+            for (const auto& command : script.commands)
+            {
+                if (CommandHasSingleZoneTarget(command))
+                {
+                    if (command.params[0] == zoneIndex)
+                    {
+                        return true;
+                    }
+                }
+                else if (command.type == mapfmt::CommandType::RotatePoly)
+                {
+                    const int first = static_cast<int>(command.params[0]);
+                    const int count = MaxValue(1, static_cast<int>(command.params[1]));
+                    if (zoneIndex >= first && zoneIndex < first + count)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool ZoneHasHardBackfaceRemovalReference(int zoneIndex)
+    {
+        if (zoneIndex < 0)
+        {
+            return false;
+        }
+
+        for (const auto& script : g_app.document.events)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+
+            for (const auto& command : script.commands)
+            {
+                if (command.type == mapfmt::CommandType::OpenDoor && command.params[0] == zoneIndex)
+                {
+                    return true;
+                }
+
+                if (command.type == mapfmt::CommandType::RotatePoly)
+                {
+                    const int first = static_cast<int>(command.params[0]);
+                    const int count = MaxValue(1, static_cast<int>(command.params[1]));
+                    if (zoneIndex >= first && zoneIndex < first + count)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool CollisionGridContainsZoneIndex(int zoneIndex)
+    {
+        if (zoneIndex < 0 || zoneIndex > 0xFFFF)
+        {
+            return false;
+        }
+
+        const uint16_t needle = static_cast<uint16_t>(zoneIndex);
+        for (const auto& plane : g_app.document.collisionGrid)
+        {
+            for (const auto& xColumn : plane)
+            {
+                for (const auto& cell : xColumn)
+                {
+                    if (std::find(cell.begin(), cell.end(), needle) != cell.end())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    std::vector<std::pair<int, int>> CollectGameplaySamplesForBackfaceRemoval()
+    {
+        std::vector<std::pair<int, int>> samples;
+        samples.reserve(128);
+
+        for (const auto& script : g_app.document.events)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+
+            for (const auto& command : script.commands)
+            {
+                if (command.type == mapfmt::CommandType::AddMonster)
+                {
+                    samples.emplace_back(static_cast<int>(command.params[1]), static_cast<int>(command.params[3]));
+                }
+                else if (command.type == mapfmt::CommandType::Teleport)
+                {
+                    samples.emplace_back(static_cast<int>(command.params[0]), static_cast<int>(command.params[2]));
+                    samples.emplace_back(static_cast<int>(command.params[1]), static_cast<int>(command.params[3]));
+                }
+            }
+        }
+
+        for (const auto& zone : g_app.document.zones)
+        {
+            if (zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::MonsterZone) ||
+                zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::EventTrigger))
+            {
+                samples.emplace_back(
+                    (static_cast<int>(zone.x1) + static_cast<int>(zone.x2)) / 2,
+                    (static_cast<int>(zone.z1) + static_cast<int>(zone.z2)) / 2);
+            }
+        }
+
+        std::sort(samples.begin(), samples.end());
+        samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+        return samples;
+    }
+
+    double ScoreWallFacingGameplaySamples(const mapfmt::Zone& zone, const std::vector<std::pair<int, int>>& samples)
+    {
+        if (samples.empty())
+        {
+            return 0.0;
+        }
+
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return 0.0;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+
+        double score = 0.0;
+        for (const auto& sample : samples)
+        {
+            const double sx = static_cast<double>(sample.first) - midX;
+            const double sz = static_cast<double>(sample.second) - midZ;
+            const double dot = sx * nx + sz * nz;
+            const double distSq = std::max(4096.0, sx * sx + sz * sz);
+
+            if (dot > 0.0)
+            {
+                score += 1.0 / distSq;
+            }
+            else if (dot < 0.0)
+            {
+                score -= 0.35 / distSq;
+            }
+        }
+        return score;
+    }
+
+
+    struct FineReachabilityMap
+    {
+        static constexpr int kStep = 32;
+        int minX = 0;
+        int minZ = 0;
+        int maxX = 0;
+        int maxZ = 0;
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> cells;
+
+        bool IsValid() const
+        {
+            return width > 0 && height > 0 && !cells.empty();
+        }
+
+        bool InRange(int x, int z) const
+        {
+            return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+        }
+
+        size_t Offset(int x, int z) const
+        {
+            return static_cast<size_t>(z - minZ) * static_cast<size_t>(width) + static_cast<size_t>(x - minX);
+        }
+
+        bool Get(int x, int z) const
+        {
+            if (!InRange(x, z))
+            {
+                return false;
+            }
+            return cells[Offset(x, z)] != 0;
+        }
+
+        void Set(int x, int z)
+        {
+            if (InRange(x, z))
+            {
+                cells[Offset(x, z)] = 1;
+            }
+        }
+    };
+
+    int WorldToFineReachabilityCell(double value)
+    {
+        return static_cast<int>(std::floor(value / static_cast<double>(FineReachabilityMap::kStep)));
+    }
+
+    POINT FineReachabilityCellCenter(int x, int z)
+    {
+        return POINT{
+            static_cast<LONG>(x * FineReachabilityMap::kStep + FineReachabilityMap::kStep / 2),
+            static_cast<LONG>(z * FineReachabilityMap::kStep + FineReachabilityMap::kStep / 2)
+        };
+    }
+
+    bool FineCellStepBlockedByWall(int fromX, int fromZ, int toX, int toZ,
+        const std::vector<int>& blockerWalls)
+    {
+        const POINT a = FineReachabilityCellCenter(fromX, fromZ);
+        const POINT b = FineReachabilityCellCenter(toX, toZ);
+        for (int wallIndex : blockerWalls)
+        {
+            if (wallIndex < 0 || wallIndex >= static_cast<int>(g_app.document.zones.size()))
+            {
+                continue;
+            }
+            const auto& wall = g_app.document.zones[static_cast<size_t>(wallIndex)];
+            if (!IsWallZone(wall) || LooksLikeNeutralMoveWallGuideForOrientation(wall) || wall.ln <= 0)
+            {
+                continue;
+            }
+            if (SegmentsIntersectInclusive(
+                static_cast<double>(a.x), static_cast<double>(a.y),
+                static_cast<double>(b.x), static_cast<double>(b.y),
+                static_cast<double>(wall.x1), static_cast<double>(wall.z1),
+                static_cast<double>(wall.x2), static_cast<double>(wall.z2)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool BuildFineGameplayReachabilityMap(const std::vector<std::pair<int, int>>& samples,
+        FineReachabilityMap& outReachable)
+    {
+        outReachable = {};
+        if (samples.empty() || g_app.document.zones.empty())
+        {
+            return false;
+        }
+
+        int minX = std::numeric_limits<int>::max();
+        int minZ = std::numeric_limits<int>::max();
+        int maxX = std::numeric_limits<int>::min();
+        int maxZ = std::numeric_limits<int>::min();
+
+        auto includeWorldPoint = [&](int x, int z)
+        {
+            minX = std::min(minX, WorldToFineReachabilityCell(static_cast<double>(x)));
+            minZ = std::min(minZ, WorldToFineReachabilityCell(static_cast<double>(z)));
+            maxX = std::max(maxX, WorldToFineReachabilityCell(static_cast<double>(x)));
+            maxZ = std::max(maxZ, WorldToFineReachabilityCell(static_cast<double>(z)));
+        };
+
+        for (const auto& sample : samples)
+        {
+            includeWorldPoint(sample.first, sample.second);
+        }
+        for (const auto& zone : g_app.document.zones)
+        {
+            includeWorldPoint(static_cast<int>(zone.x1), static_cast<int>(zone.z1));
+            includeWorldPoint(static_cast<int>(zone.x2), static_cast<int>(zone.z2));
+        }
+
+        if (minX == std::numeric_limits<int>::max())
+        {
+            return false;
+        }
+
+        constexpr int kMarginCells = 8;
+        minX = std::max(0, minX - kMarginCells);
+        minZ = std::max(0, minZ - kMarginCells);
+        maxX = std::min(511, maxX + kMarginCells);
+        maxZ = std::min(511, maxZ + kMarginCells);
+        if (maxX < minX || maxZ < minZ)
+        {
+            return false;
+        }
+
+        outReachable.minX = minX;
+        outReachable.minZ = minZ;
+        outReachable.maxX = maxX;
+        outReachable.maxZ = maxZ;
+        outReachable.width = maxX - minX + 1;
+        outReachable.height = maxZ - minZ + 1;
+        outReachable.cells.assign(static_cast<size_t>(outReachable.width) * static_cast<size_t>(outReachable.height), 0);
+
+        std::vector<int> blockerWalls;
+        blockerWalls.reserve(g_app.document.zones.size());
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            const auto& zone = g_app.document.zones[static_cast<size_t>(i)];
+            if (IsWallZone(zone) && zone.ln > 0 && !LooksLikeNeutralMoveWallGuideForOrientation(zone))
+            {
+                blockerWalls.push_back(i);
+            }
+        }
+
+        std::vector<POINT> stack;
+        stack.reserve(samples.size() * 4);
+        for (const auto& sample : samples)
+        {
+            const int cx = WorldToFineReachabilityCell(static_cast<double>(sample.first));
+            const int cz = WorldToFineReachabilityCell(static_cast<double>(sample.second));
+            if (!outReachable.InRange(cx, cz) || outReachable.Get(cx, cz))
+            {
+                continue;
+            }
+            outReachable.Set(cx, cz);
+            stack.push_back(POINT{ static_cast<LONG>(cx), static_cast<LONG>(cz) });
+        }
+
+        const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+        while (!stack.empty())
+        {
+            const POINT cell = stack.back();
+            stack.pop_back();
+            for (const auto& dir : dirs)
+            {
+                const int nx = static_cast<int>(cell.x) + dir[0];
+                const int nz = static_cast<int>(cell.y) + dir[1];
+                if (!outReachable.InRange(nx, nz) || outReachable.Get(nx, nz))
+                {
+                    continue;
+                }
+                if (FineCellStepBlockedByWall(static_cast<int>(cell.x), static_cast<int>(cell.y), nx, nz, blockerWalls))
+                {
+                    continue;
+                }
+                outReachable.Set(nx, nz);
+                stack.push_back(POINT{ static_cast<LONG>(nx), static_cast<LONG>(nz) });
+            }
+        }
+
+        return true;
+    }
+
+    bool FineReachableCellForWorldPoint(double x, double z, const FineReachabilityMap& reachable)
+    {
+        if (!reachable.IsValid())
+        {
+            return false;
+        }
+        return reachable.Get(WorldToFineReachabilityCell(x), WorldToFineReachabilityCell(z));
+    }
+
+    int FineWallFacingState(const mapfmt::Zone& zone, const FineReachabilityMap& reachable)
+    {
+        if (!reachable.IsValid())
+        {
+            return 0;
+        }
+
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return 0;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+        int frontVotes = 0;
+        int backVotes = 0;
+        constexpr double offsets[] = { 16.0, 32.0, 48.0, 64.0, 96.0 };
+        for (double offset : offsets)
+        {
+            const bool frontReachable = FineReachableCellForWorldPoint(midX + nx * offset, midZ + nz * offset, reachable);
+            const bool backReachable = FineReachableCellForWorldPoint(midX - nx * offset, midZ - nz * offset, reachable);
+            if (frontReachable && !backReachable)
+            {
+                ++frontVotes;
+            }
+            else if (!frontReachable && backReachable)
+            {
+                ++backVotes;
+            }
+        }
+
+        if (frontVotes >= 2 && backVotes == 0)
+        {
+            return 1;
+        }
+        if (backVotes >= 2 && frontVotes == 0)
+        {
+            return -1;
+        }
+        if (frontVotes >= 3 && frontVotes > backVotes + 1)
+        {
+            return 1;
+        }
+        if (backVotes >= 3 && backVotes > frontVotes + 1)
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    bool WallPlayerSideFacesThinWallThickness(int zoneIndex, const mapfmt::Zone& zone)
+    {
+        if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size()) ||
+            !IsWallZone(zone) || zone.ln <= 0)
+        {
+            return false;
+        }
+
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return false;
+        }
+
+        const double dx = static_cast<double>(zone.x2) - static_cast<double>(zone.x1);
+        const double dz = static_cast<double>(zone.z2) - static_cast<double>(zone.z1);
+        const double len = std::hypot(dx, dz);
+        if (len < 1.0)
+        {
+            return false;
+        }
+
+        const double tx = dx / len;
+        const double tz = dz / len;
+        constexpr double kMaxThickness = 48.0;
+        constexpr double kDistanceEpsilon = 2.0;
+
+        for (int otherIndex = 0; otherIndex < static_cast<int>(g_app.document.zones.size()); ++otherIndex)
+        {
+            if (otherIndex == zoneIndex)
+            {
+                continue;
+            }
+
+            const auto& other = g_app.document.zones[static_cast<size_t>(otherIndex)];
+            if (!IsWallZone(other) || other.ln <= 0 || LooksLikeNeutralMoveWallGuideForOrientation(other))
+            {
+                continue;
+            }
+
+            const double odx = static_cast<double>(other.x2) - static_cast<double>(other.x1);
+            const double odz = static_cast<double>(other.z2) - static_cast<double>(other.z1);
+            const double otherLen = std::hypot(odx, odz);
+            if (otherLen < 1.0)
+            {
+                continue;
+            }
+
+            const double cross = dx * odz - dz * odx;
+            if (std::abs(cross) > std::max(1.0, len * otherLen * 0.001))
+            {
+                continue;
+            }
+
+            const double d1 = (static_cast<double>(other.x1) - static_cast<double>(zone.x1)) * nx +
+                              (static_cast<double>(other.z1) - static_cast<double>(zone.z1)) * nz;
+            const double d2 = (static_cast<double>(other.x2) - static_cast<double>(zone.x1)) * nx +
+                              (static_cast<double>(other.z2) - static_cast<double>(zone.z1)) * nz;
+            if (std::abs(d1 - d2) > 4.0)
+            {
+                continue;
+            }
+
+            const double signedDistance = (d1 + d2) * 0.5;
+            if (signedDistance <= kDistanceEpsilon || signedDistance > kMaxThickness)
+            {
+                continue;
+            }
+
+            const double p1 = (static_cast<double>(other.x1) - static_cast<double>(zone.x1)) * tx +
+                              (static_cast<double>(other.z1) - static_cast<double>(zone.z1)) * tz;
+            const double p2 = (static_cast<double>(other.x2) - static_cast<double>(zone.x1)) * tx +
+                              (static_cast<double>(other.z2) - static_cast<double>(zone.z1)) * tz;
+            const double otherMin = std::min(p1, p2);
+            const double otherMax = std::max(p1, p2);
+            const double overlap = std::min(len, otherMax) - std::max(0.0, otherMin);
+            const double requiredOverlap = std::min(64.0, len * 0.45);
+            if (overlap >= requiredOverlap)
+            {
+                // A near-parallel wall directly in front of this wall within one
+                // eighth-tile is wall thickness, not playable space.  This catches
+                // remaining jamb/cap walls like Z30 and Z110 where flood-fill or
+                // gameplay samples can leak into the tiny 32-unit construction gap.
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool WallFacesReachableArea(
+        const mapfmt::Zone& zone,
+        const std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize>& reachable)
+    {
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return false;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+        constexpr double sampleOffset = 72.0;
+        return ReachableCellForWorldPoint(midX + nx * sampleOffset, midZ + nz * sampleOffset, reachable);
+    }
+
+    std::vector<int> FindAwayFacingBackfaceRemovalCandidates()
+    {
+        std::vector<int> candidates;
+
+        std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize> reachable{};
+        const bool hasPlayerReachability = BuildPlayerReachabilityMapForWallFacing(reachable);
+        const std::vector<std::pair<int, int>> gameplaySamples = CollectGameplaySamplesForBackfaceRemoval();
+        FineReachabilityMap fineReachable;
+        const bool hasFineReachability = BuildFineGameplayReachabilityMap(gameplaySamples, fineReachable);
+
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+        std::vector<uint8_t> consumed(g_app.document.zones.size(), 0);
+
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            if (consumed[static_cast<size_t>(i)] != 0)
+            {
+                continue;
+            }
+            if (!IsWallZone(g_app.document.zones[static_cast<size_t>(i)]) || IsZoneValidationIgnored(i))
+            {
+                continue;
+            }
+
+            for (int j = i + 1; j < static_cast<int>(g_app.document.zones.size()); ++j)
+            {
+                if (consumed[static_cast<size_t>(j)] != 0)
+                {
+                    continue;
+                }
+                if (IsZoneValidationIgnored(j) ||
+                    !AreReverseWallPair(g_app.document.zones[static_cast<size_t>(i)], g_app.document.zones[static_cast<size_t>(j)]))
+                {
+                    continue;
+                }
+
+                consumed[static_cast<size_t>(i)] = 1;
+                consumed[static_cast<size_t>(j)] = 1;
+
+                const bool iProtected = IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, i) ||
+                    LooksLikeNeutralMoveWallGuideForOrientation(g_app.document.zones[static_cast<size_t>(i)]) ||
+                    ZoneHasHardBackfaceRemovalReference(i);
+                const bool jProtected = IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, j) ||
+                    LooksLikeNeutralMoveWallGuideForOrientation(g_app.document.zones[static_cast<size_t>(j)]) ||
+                    ZoneHasHardBackfaceRemovalReference(j);
+                if (iProtected || jProtected)
+                {
+                    break;
+                }
+
+                int candidate = -1;
+
+                if (hasFineReachability)
+                {
+                    const int iFineState = FineWallFacingState(g_app.document.zones[static_cast<size_t>(i)], fineReachable);
+                    const int jFineState = FineWallFacingState(g_app.document.zones[static_cast<size_t>(j)], fineReachable);
+                    if (iFineState != jFineState)
+                    {
+                        if (iFineState > 0 && jFineState < 0)
+                        {
+                            candidate = j;
+                        }
+                        else if (jFineState > 0 && iFineState < 0)
+                        {
+                            candidate = i;
+                        }
+                    }
+                }
+
+                if (candidate < 0 && hasPlayerReachability)
+                {
+                    const bool iFacesReachable = WallFacesReachableArea(g_app.document.zones[static_cast<size_t>(i)], reachable);
+                    const bool jFacesReachable = WallFacesReachableArea(g_app.document.zones[static_cast<size_t>(j)], reachable);
+                    if (iFacesReachable != jFacesReachable)
+                    {
+                        candidate = iFacesReachable ? j : i;
+                    }
+                }
+
+                // PlayerStart flood-fill only covers rooms reachable without going
+                // through still-closed gameplay structures.  For later rooms, use
+                // real gameplay samples (players, monsters, objects, teleport ends,
+                // trigger/helper line midpoints) to choose which side faces playable
+                // space.  This catches maps where old editor backfaces remained in
+                // rooms that the strict flood-fill could not visit yet.
+                if (candidate < 0 && !gameplaySamples.empty())
+                {
+                    const double iScore = ScoreWallFacingGameplaySamples(g_app.document.zones[static_cast<size_t>(i)], gameplaySamples);
+                    const double jScore = ScoreWallFacingGameplaySamples(g_app.document.zones[static_cast<size_t>(j)], gameplaySamples);
+                    // Be decisive for exact reverse/backface duplicates: if the
+                    // gameplay hints prefer one side, the other side is the
+                    // outside-facing visual duplicate. Earlier versions used a
+                    // non-zero epsilon and left many later-room wall sides behind.
+                    if (iScore != jScore)
+                    {
+                        candidate = (iScore > jScore) ? j : i;
+                    }
+                }
+
+                // Last resort for old editor maps: if only one side is present in
+                // the loaded game grid, the other side is almost always the visual
+                // backface duplicate.  Removing that duplicate makes the 2D/3D
+                // editor data match the actual exported gameplay grid again.
+                if (candidate < 0)
+                {
+                    const bool iInGrid = CollisionGridContainsZoneIndex(i);
+                    const bool jInGrid = CollisionGridContainsZoneIndex(j);
+                    if (iInGrid != jInGrid)
+                    {
+                        candidate = iInGrid ? j : i;
+                    }
+                }
+
+                if (candidate == i || candidate == j)
+                {
+                    candidates.push_back(candidate);
+                }
+                break;
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        return candidates;
+    }
+
+
+    bool WallHasReversePair(int zoneIndex)
+    {
+        return FindReverseWallPairIndex(zoneIndex) >= 0;
+    }
+
+    bool WallClearlyFacesAwayFromGameplay(
+        const mapfmt::Zone& zone,
+        const std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize>& reachable,
+        bool hasPlayerReachability,
+        const std::vector<std::pair<int, int>>& gameplaySamples,
+        const FineReachabilityMap& fineReachable,
+        bool hasFineReachability)
+    {
+        if (hasFineReachability)
+        {
+            const int fineState = FineWallFacingState(zone, fineReachable);
+            if (fineState < 0)
+            {
+                return true;
+            }
+            if (fineState > 0)
+            {
+                return false;
+            }
+        }
+
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return false;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+        constexpr double sampleOffset = 72.0;
+
+        if (hasPlayerReachability)
+        {
+            const bool frontReachable = ReachableCellForWorldPoint(midX + nx * sampleOffset, midZ + nz * sampleOffset, reachable);
+            const bool backReachable = ReachableCellForWorldPoint(midX - nx * sampleOffset, midZ - nz * sampleOffset, reachable);
+            if (!frontReachable && backReachable)
+            {
+                return true;
+            }
+            if (frontReachable && !backReachable)
+            {
+                return false;
+            }
+        }
+
+        if (!gameplaySamples.empty())
+        {
+            const double score = ScoreWallFacingGameplaySamples(zone, gameplaySamples);
+            // Keep this threshold deliberately tiny: the score is inverse-distance
+            // weighted and therefore numerically small on large maps.  A negative
+            // value means the gameplay hints are predominantly on the back side of
+            // the wall, so the line should be flipped instead of left as a
+            // transparent/outside-facing one.
+            constexpr double kAwayFacingScoreEpsilon = -0.00000001;
+            return score < kAwayFacingScoreEpsilon;
+        }
+
+        return false;
+    }
+
+    std::vector<int> FindAwayFacingWallFlipCandidates()
+    {
+        std::vector<int> candidates;
+
+        std::array<std::array<uint8_t, mapfmt::MapDocument::kGridSize>, mapfmt::MapDocument::kGridSize> reachable{};
+        const bool hasPlayerReachability = BuildPlayerReachabilityMapForWallFacing(reachable);
+        const std::vector<std::pair<int, int>> gameplaySamples = CollectGameplaySamplesForBackfaceRemoval();
+        FineReachabilityMap fineReachable;
+        const bool hasFineReachability = BuildFineGameplayReachabilityMap(gameplaySamples, fineReachable);
+        const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
+
+        for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+        {
+            const auto& zone = g_app.document.zones[static_cast<size_t>(i)];
+            if (!IsWallZone(zone) ||
+                IsZoneValidationIgnored(i) ||
+                IsMoveWallGroupGuideZoneIndex(moveWallGuideMask, i) ||
+                LooksLikeNeutralMoveWallGuideForOrientation(zone) ||
+                ZoneHasHardBackfaceRemovalReference(i))
+            {
+                continue;
+            }
+
+            // v25: do not skip exact reverse/backface pairs; also catch thin 32-unit wall-thickness/jamb cases before reachability fallback.
+            // Earlier versions only handled them in the Backface pass. That left
+            // many visually wrong, player-transparent walls untouched when the
+            // pair itself was ambiguous or already same-side-normalized.  Treat
+            // every unprotected wall line with a clearly wrong player-facing side
+            // as flippable; the repair keeps zone indices stable and MapFormat
+            // still exports only one active physical grid side.
+            if (WallPlayerSideFacesThinWallThickness(i, zone) ||
+                WallClearlyFacesAwayFromGameplay(zone, reachable, hasPlayerReachability, gameplaySamples, fineReachable, hasFineReachability))
+            {
+                candidates.push_back(i);
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        return candidates;
+    }
+
+    int FlipAwayFacingWalls(const std::vector<int>& zoneIndices)
+    {
+        int flipped = 0;
+        for (int zoneIndex : zoneIndices)
+        {
+            if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size()))
+            {
+                continue;
+            }
+            auto& zone = g_app.document.zones[static_cast<size_t>(zoneIndex)];
+            if (!IsWallZone(zone) || ZoneHasHardBackfaceRemovalReference(zoneIndex))
+            {
+                continue;
+            }
+            ReverseWallDirectionPreservingTexture(zone);
+            mapfmt::RecalculateWallMetadata(zone);
+            UpdateWallTextureBandCountFromLength(zone);
+            SyncExistingBackfaceWallFromFront(zoneIndex);
+            ++flipped;
+        }
+        return flipped;
+    }
+
+    bool FlipSelectedWallFacing()
+    {
+        if (!IsSelectedWall())
+        {
+            MessageBeep(MB_ICONINFORMATION);
+            return false;
+        }
+
+        const int zoneIndex = g_app.selectedZone;
+        PushUndoSnapshot();
+        auto& zone = g_app.document.zones[static_cast<size_t>(zoneIndex)];
+        ReverseWallDirectionPreservingTexture(zone);
+        mapfmt::RecalculateWallMetadata(zone);
+        UpdateWallTextureBandCountFromLength(zone);
+        SyncExistingBackfaceWallFromFront(zoneIndex);
+        MarkDirty();
+        RefreshZoneList();
+        InvalidateEditorViewsIncludingWalkPreview();
+        RefreshStatus();
+        return true;
+    }
+
+    bool ToggleSelectedWallValidationIgnore()
+    {
+        if (!IsSelectedWall())
+        {
+            MessageBeep(MB_ICONINFORMATION);
+            return false;
+        }
+
+        EnsureValidationIgnoreSize();
+        const int zoneIndex = g_app.selectedZone;
+        if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.validationIgnoreZones.size()))
+        {
+            MessageBeep(MB_ICONINFORMATION);
+            return false;
+        }
+
+        PushUndoSnapshot();
+        g_app.validationIgnoreZones[static_cast<size_t>(zoneIndex)] =
+            g_app.validationIgnoreZones[static_cast<size_t>(zoneIndex)] ? 0 : 1;
+
+        RefreshZoneList();
+        RefreshStatus();
+        InvalidateEditorViewsIncludingWalkPreview();
+        return true;
+    }
+
+    void AdjustZoneIndexAfterDelete(int& zoneIndex, int deletedZoneIndex)
+    {
+        if (zoneIndex < 0 || deletedZoneIndex < 0)
+        {
+            return;
+        }
+        if (zoneIndex == deletedZoneIndex)
+        {
+            zoneIndex = -1;
+        }
+        else if (zoneIndex > deletedZoneIndex)
+        {
+            --zoneIndex;
+        }
+    }
+
+    int RemoveAwayFacingBackfaceWalls(const std::vector<int>& zoneIndices)
+    {
+        if (zoneIndices.empty())
+        {
+            return 0;
+        }
+
+        std::vector<int> toFlip = zoneIndices;
+        std::sort(toFlip.begin(), toFlip.end());
+        toFlip.erase(std::unique(toFlip.begin(), toFlip.end()), toFlip.end());
+
+        int flipped = 0;
+        for (int zoneIndex : toFlip)
+        {
+            if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size()))
+            {
+                continue;
+            }
+
+            auto& zone = g_app.document.zones[static_cast<size_t>(zoneIndex)];
+            if (!IsWallZone(zone) || ZoneHasHardBackfaceRemovalReference(zoneIndex))
+            {
+                continue;
+            }
+
+            // Keep the zone index stable and flip the away-facing visual backface
+            // instead of deleting/remapping it.  Deleting was fragile around
+            // event/door/move-wall data and could leave the wrong physical side
+            // as the survivor.  Flipping turns the old reverse duplicate into a
+            // same-facing duplicate; MapFormat.cpp then writes only one active
+            // physical side into the game grid.
+            ReverseWallDirectionPreservingTexture(zone);
+            UpdateWallTextureBandCountFromLength(zone);
+            ++flipped;
+        }
+
+        return flipped;
+    }
+
+
+    void DrawWallFacingArrow(HDC hdc, const RECT& rc, const mapfmt::Bounds& bounds, const mapfmt::Zone& zone, bool selected)
+    {
+        if (!IsWallZone(zone) || LooksLikeNeutralMoveWallGuideForOrientation(zone))
+        {
+            return;
+        }
+
+        double nx = 0.0;
+        double nz = 0.0;
+        if (!GetWallPlayerFacingUnitNormal(zone, nx, nz))
+        {
+            return;
+        }
+
+        const POINT p1 = WorldToScreen(rc, bounds, zone.x1, zone.z1);
+        const POINT p2 = WorldToScreen(rc, bounds, zone.x2, zone.z2);
+        const double screenLen = std::hypot(static_cast<double>(p2.x - p1.x), static_cast<double>(p2.y - p1.y));
+        if (!selected && screenLen < 26.0)
+        {
+            return;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+        const double arrowWorldLen = selected ? 39.0 : 27.0;
+        const POINT base = WorldToScreen(rc, bounds,
+            static_cast<int>(std::lround(midX)),
+            static_cast<int>(std::lround(midZ)));
+        const POINT tip = WorldToScreen(rc, bounds,
+            static_cast<int>(std::lround(midX + nx * arrowWorldLen)),
+            static_cast<int>(std::lround(midZ + nz * arrowWorldLen)));
+
+        const double dx = static_cast<double>(tip.x - base.x);
+        const double dy = static_cast<double>(tip.y - base.y);
+        const double len = std::hypot(dx, dy);
+        if (len < 5.0)
+        {
+            return;
+        }
+
+        const double ux = dx / len;
+        const double uy = dy / len;
+        const double px = -uy;
+        const double py = ux;
+        const int headLen = selected ? 9 : 7;
+        const int headHalf = selected ? 5 : 4;
+        const COLORREF color = selected ? RGB(255, 245, 160) : RGB(255, 178, 76);
+
+        HPEN pen = CreatePen(PS_SOLID, selected ? 2 : 1, color);
+        HBRUSH brush = CreateSolidBrush(color);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        MoveToEx(hdc, base.x, base.y, nullptr);
+        LineTo(hdc, tip.x, tip.y);
+
+        POINT head[3] =
+        {
+            tip,
+            POINT{ static_cast<LONG>(std::lround(static_cast<double>(tip.x) - ux * headLen + px * headHalf)),
+                   static_cast<LONG>(std::lround(static_cast<double>(tip.y) - uy * headLen + py * headHalf)) },
+            POINT{ static_cast<LONG>(std::lround(static_cast<double>(tip.x) - ux * headLen - px * headHalf)),
+                   static_cast<LONG>(std::lround(static_cast<double>(tip.y) - uy * headLen - py * headHalf)) }
+        };
+        Polygon(hdc, head, 3);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(brush);
+        DeleteObject(pen);
     }
 
     void DrawDottedArrowLine(HDC hdc, const POINT& from, const POINT& to, COLORREF color)
@@ -8548,6 +9850,25 @@ namespace
         InvalidateEditorViews();
     }
 
+    bool IsToolbarButtonFocused()
+    {
+        HWND focus = GetFocus();
+        return focus != nullptr && g_app.mainWindow != nullptr && IsChild(g_app.mainWindow, focus) && IsButtonClass(focus);
+    }
+
+    void ReturnKeyboardFocusToCanvas()
+    {
+        HWND focus = GetFocus();
+        if (focus && IsButtonClass(focus))
+        {
+            SendMessageW(focus, BM_SETSTATE, FALSE, 0);
+        }
+        if (g_app.canvas && IsWindow(g_app.canvas))
+        {
+            SetFocus(g_app.canvas);
+        }
+    }
+
     void CancelCurrentTool()
     {
         bool changed = false;
@@ -8586,6 +9907,7 @@ namespace
             RefreshStatus();
             InvalidateEditorViews();
         }
+        ReturnKeyboardFocusToCanvas();
     }
 
     void SetInsertMode(InsertMode mode)
@@ -8970,7 +10292,7 @@ namespace
         SetWindowTextW(hwnd, Utf8ToWide(text).c_str());
     }
 
-    std::string GetOpenOrSavePath(HWND owner, bool saveMode, const wchar_t* title, const wchar_t* defaultExt = L"map")
+    std::string GetOpenOrSavePath(HWND owner, bool saveMode, const wchar_t* title, const wchar_t* defaultExt = nullptr)
     {
         std::array<wchar_t, MAX_PATH> buffer{};
         OPENFILENAMEW ofn{};
@@ -9259,8 +10581,12 @@ namespace
     std::wstring ZoneToListText(const mapfmt::Zone& zone, int index)
     {
         std::wstringstream ss;
-        ss << L"[" << index << L"] " << ZoneRoleToText(zone)
-           << L"  E" << zone.ev
+        ss << L"[" << index << L"] " << ZoneRoleToText(zone);
+        if (IsZoneValidationIgnored(index))
+        {
+            ss << L"  [IGNORE]";
+        }
+        ss << L"  E" << zone.ev
            << L"  (" << zone.x1 << L"," << zone.z1 << L") -> (" << zone.x2 << L"," << zone.z2 << L")";
         return ss.str();
     }
@@ -9273,8 +10599,12 @@ namespace
         {
             const auto& zone = g_app.document.zones[g_app.selectedZone];
             ss << L"Selected zone " << g_app.selectedZone
-               << L"  Type: " << ZoneRoleToText(zone)
-               << L"  Event: " << zone.ev
+               << L"  Type: " << ZoneRoleToText(zone);
+            if (IsZoneValidationIgnored(g_app.selectedZone))
+            {
+                ss << L"  IGNORE";
+            }
+            ss << L"  Event: " << zone.ev
                << L"  Mode: " << InsertModeToText(g_app.insertMode)
                << L"  Zoom: " << static_cast<int>(std::lround(g_app.canvasZoom * 100.0)) << L"%";
         }
@@ -9356,6 +10686,7 @@ namespace
 
     void RefreshZoneList()
     {
+        EnsureValidationIgnoreSize();
         SendMessageW(g_app.zoneList, LB_RESETCONTENT, 0, 0);
         for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
         {
@@ -9395,6 +10726,7 @@ namespace
         EditorSnapshot snap;
         snap.document = g_app.document;
         snap.selectedZone = g_app.selectedZone;
+        snap.validationIgnoreZones = g_app.validationIgnoreZones;
         if (g_app.undoStack.size() >= kMaxUndoSteps)
         {
             g_app.undoStack.erase(g_app.undoStack.begin());
@@ -9418,6 +10750,8 @@ namespace
         g_app.undoStack.pop_back();
         g_app.document = std::move(snap.document);
         g_app.selectedZone = snap.selectedZone;
+        g_app.validationIgnoreZones = std::move(snap.validationIgnoreZones);
+        EnsureValidationIgnoreSize();
         ClearSelectedMonsterSpawn();
         ClearSelectedTeleportTarget();
         if (g_app.selectedZone >= static_cast<int>(g_app.document.zones.size()))
@@ -9487,11 +10821,26 @@ namespace
         }
         if (msg.wParam == VK_ESCAPE)
         {
-            if (g_app.insertMode != InsertMode::None || g_app.isDrawing || g_app.isPanning)
+            if (g_app.insertMode != InsertMode::None || g_app.isDrawing || g_app.isPanning || IsToolbarButtonFocused())
             {
                 CancelCurrentTool();
                 return true;
             }
+        }
+        if (!ctrlDown && msg.wParam == VK_BACK)
+        {
+            return FlipSelectedWallFacing();
+        }
+        if (!ctrlDown && msg.wParam == VK_END)
+        {
+            return ToggleSelectedWallValidationIgnore();
+        }
+        if (!ctrlDown && msg.wParam == VK_HOME)
+        {
+            FitViewToDocument();
+            RefreshStatus();
+            InvalidateEditorViewsIncludingWalkPreview();
+            return true;
         }
         if (msg.wParam == VK_DELETE)
         {
@@ -9541,6 +10890,11 @@ namespace
             UpdateWallTextureBandCountFromLength(zone);
         }
 
+        // v26: do not silently flip wall facing on every save.
+        // Validate Map / Apply Safe Fixes still offers automatic facing repairs,
+        // but manual BACKSPACE flips must remain stable for intentional cases
+        // such as background walls behind transparent panels.
+
         std::string error;
         if (!g_app.document.SaveToFile(path, error))
         {
@@ -9548,6 +10902,11 @@ namespace
             return false;
         }
 
+        if (!SaveSurfaceTextureMetadataForMap(path, error))
+        {
+            MessageBoxW(g_app.mainWindow, Utf8ToWide(error).c_str(), L"Save Metadata Failed", MB_OK | MB_ICONERROR);
+            return false;
+        }
 
         g_app.document.sourcePath = path;
         g_app.document.dirty = false;
@@ -9562,6 +10921,9 @@ namespace
     {
         if (!ConfirmDiscardChanges()) return;
         g_app.document.NewBlank();
+        g_app.validationIgnoreZones.clear();
+        g_app.validationIgnoreZones.clear();
+        EnsureValidationIgnoreSize();
         RefreshGameProfile();
         g_app.objectPreviewCache.clear();
         ClearUndoHistory();
@@ -9599,7 +10961,10 @@ namespace
             return false;
         }
 
+        g_app.validationIgnoreZones.clear();
+        EnsureValidationIgnoreSize();
         RefreshGameProfile();
+        LoadSurfaceTextureMetadataForMap(path);
         g_app.objectPreviewCache.clear();
         ClearUndoHistory();
         g_app.selectedZone = g_app.document.zones.empty() ? -1 : 0;
@@ -11799,7 +13164,7 @@ namespace
             g_app.selectedZone = static_cast<int>(g_app.document.zones.size()) - 1;
             if (zone.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall))
             {
-                EnsureBackfaceForWallAtIndex(g_app.selectedZone);
+                // v26: Add Zone creates one original-style wall side only.
             }
             MarkDirty();
             RefreshZoneList();
@@ -11829,7 +13194,7 @@ namespace
                 }
                 else
                 {
-                    EnsureBackfaceForWallAtIndex(g_app.selectedZone);
+                    // v26: editing a single-sided wall must not create a new hidden backface.
                 }
             }
             MarkDirty();
@@ -11942,7 +13307,9 @@ namespace
             RemoveEventReferencesForDeletedZoneIndex(second);
             RemoveEventReferencesForDeletedZoneIndex(first);
             g_app.document.zones.erase(g_app.document.zones.begin() + second);
+            RemoveValidationIgnoreIndex(second);
             g_app.document.zones.erase(g_app.document.zones.begin() + first);
+            RemoveValidationIgnoreIndex(first);
             g_app.selectedZone = MinValue(first, static_cast<int>(g_app.document.zones.size()) - 1);
         }
         else
@@ -11950,6 +13317,7 @@ namespace
             const int deletedZone = g_app.selectedZone;
             RemoveEventReferencesForDeletedZoneIndex(deletedZone);
             g_app.document.zones.erase(g_app.document.zones.begin() + deletedZone);
+            RemoveValidationIgnoreIndex(deletedZone);
             if (g_app.selectedZone >= static_cast<int>(g_app.document.zones.size())) g_app.selectedZone = static_cast<int>(g_app.document.zones.size()) - 1;
         }
         MarkDirty();
@@ -11967,6 +13335,7 @@ namespace
             const int oldIndex = g_app.selectedZone;
             const int newIndex = g_app.selectedZone - 1;
             std::swap(g_app.document.zones[oldIndex], g_app.document.zones[newIndex]);
+            SwapValidationIgnoreIndices(oldIndex, newIndex);
             SwapEventZoneReferences(oldIndex, newIndex);
             --g_app.selectedZone;
             MarkDirty();
@@ -11984,6 +13353,7 @@ namespace
             const int oldIndex = g_app.selectedZone;
             const int newIndex = g_app.selectedZone + 1;
             std::swap(g_app.document.zones[oldIndex], g_app.document.zones[newIndex]);
+            SwapValidationIgnoreIndices(oldIndex, newIndex);
             SwapEventZoneReferences(oldIndex, newIndex);
             ++g_app.selectedZone;
             MarkDirty();
@@ -12016,6 +13386,46 @@ namespace
         {
             values.push_back(value);
             std::sort(values.begin(), values.end());
+        }
+    }
+
+    void EnsureValidationIgnoreSize()
+    {
+        const size_t zoneCount = g_app.document.zones.size();
+        if (g_app.validationIgnoreZones.size() != zoneCount)
+        {
+            g_app.validationIgnoreZones.resize(zoneCount, 0);
+        }
+    }
+
+    bool IsZoneValidationIgnored(int zoneIndex)
+    {
+        if (zoneIndex < 0) return false;
+        EnsureValidationIgnoreSize();
+        const size_t index = static_cast<size_t>(zoneIndex);
+        return index < g_app.validationIgnoreZones.size() && g_app.validationIgnoreZones[index] != 0;
+    }
+
+    void RemoveValidationIgnoreIndex(int zoneIndex)
+    {
+        if (zoneIndex < 0) return;
+        EnsureValidationIgnoreSize();
+        const size_t index = static_cast<size_t>(zoneIndex);
+        if (index < g_app.validationIgnoreZones.size())
+        {
+            g_app.validationIgnoreZones.erase(g_app.validationIgnoreZones.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+    }
+
+    void SwapValidationIgnoreIndices(int a, int b)
+    {
+        if (a < 0 || b < 0 || a == b) return;
+        EnsureValidationIgnoreSize();
+        const size_t ia = static_cast<size_t>(a);
+        const size_t ib = static_cast<size_t>(b);
+        if (ia < g_app.validationIgnoreZones.size() && ib < g_app.validationIgnoreZones.size())
+        {
+            std::swap(g_app.validationIgnoreZones[ia], g_app.validationIgnoreZones[ib]);
         }
     }
 
@@ -12129,6 +13539,8 @@ namespace
         std::vector<int> triggerlessEvents;
         std::vector<int> emptyTriggeredEvents;
         std::vector<int> nonNeutralMoveGuides;
+        std::vector<int> awayFacingBackfaceCandidates = FindAwayFacingBackfaceRemovalCandidates();
+        std::vector<int> awayFacingWallFlipCandidates = FindAwayFacingWallFlipCandidates();
         std::vector<std::wstring> invalidZoneReferences;
         std::vector<std::wstring> objectOutsideMapIssues;
         const std::vector<uint8_t> moveWallGuideMask = BuildMoveWallGroupGuideMaskForDocument(g_app.document);
@@ -12315,7 +13727,9 @@ namespace
             }
             if (!triggerlessEvents.empty())
             {
-                ss << L"[WARN] Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents) << L"\r\n";
+                ss << L"[WARN] Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents)
+                   << L". Apply Safe Fixes can clear these orphaned event command(s).\r\n";
+                sections.safeClearTriggerlessEventSlots = triggerlessEvents;
             }
             else
             {
@@ -12370,6 +13784,41 @@ namespace
             {
                 ss << L"[OK] Move-Wallblock guide zones look AI/collision-neutral\r\n";
             }
+            {
+                int ignoredWallCount = 0;
+                EnsureValidationIgnoreSize();
+                for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+                {
+                    if (IsZoneValidationIgnored(i) && IsWallZone(g_app.document.zones[static_cast<size_t>(i)]))
+                    {
+                        ++ignoredWallCount;
+                    }
+                }
+                if (ignoredWallCount > 0)
+                {
+                    ss << L"[INFO] " << ignoredWallCount << L" wall line(s) are marked IGNORE and skipped by wall-facing/backface validation. Use END on a selected wall to toggle this.\r\n";
+                }
+            }
+            if (!awayFacingBackfaceCandidates.empty())
+            {
+                ss << L"[WARN] Away-facing Backface wall line(s) found: " << FormatObjectTypeList(awayFacingBackfaceCandidates)
+                   << L". Apply Safe Fixes can flip these reverse wall duplicate(s) toward the playable side; door/move-wall controlled lines remain protected and unfinished/open maps can still be saved without applying the fix.\r\n";
+                sections.safeRemoveAwayFacingBackfaces = awayFacingBackfaceCandidates;
+            }
+            else
+            {
+                ss << L"[OK] No safely flippable away-facing Backface wall lines found\r\n";
+            }
+            if (!awayFacingWallFlipCandidates.empty())
+            {
+                ss << L"[WARN] Away-facing wall line(s) found: " << FormatObjectTypeList(awayFacingWallFlipCandidates)
+                   << L". Apply Safe Fixes can flip these wall(s) so their visible side faces the playable room; this also covers remaining reverse/backface pairs whose visible side is clearly wrong.\r\n";
+                sections.safeFlipAwayFacingWalls = awayFacingWallFlipCandidates;
+            }
+            else
+            {
+                ss << L"[OK] No safely flippable away-facing wall lines found\r\n";
+            }
             sections.checks = ss.str();
         }
 
@@ -12408,7 +13857,8 @@ namespace
             if (!triggerlessEvents.empty())
             {
                 std::wstringstream line;
-                line << L"Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents) << L". Add trigger lines or intentionally move one-shot setup commands to Event 1.";
+                line << L"Event slot(s) with commands but no trigger: " << FormatObjectTypeList(triggerlessEvents)
+                     << L". Apply Safe Fixes will clear these orphaned event commands, or add trigger lines if you still need them.";
                 addSuggestion(L"[WARN]", line.str());
             }
             if (!emptyTriggeredEvents.empty())
@@ -12451,6 +13901,37 @@ namespace
             {
                 std::wstringstream line;
                 line << L"Move-Wallblock guide zone(s) " << FormatObjectTypeList(nonNeutralMoveGuides) << L" can be repaired safely: 'Apply Safe Fixes' will make them invisible and AI/collision-neutral.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            {
+                int ignoredWallCount = 0;
+                EnsureValidationIgnoreSize();
+                for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
+                {
+                    if (IsZoneValidationIgnored(i) && IsWallZone(g_app.document.zones[static_cast<size_t>(i)]))
+                    {
+                        ++ignoredWallCount;
+                    }
+                }
+                if (ignoredWallCount > 0)
+                {
+                    std::wstringstream line;
+                    line << ignoredWallCount << L" wall line(s) are marked IGNORE and skipped by wall-facing/backface validation. Use END on a selected wall to toggle this.";
+                    addSuggestion(L"[INFO]", line.str());
+                }
+            }
+            if (!awayFacingBackfaceCandidates.empty())
+            {
+                std::wstringstream line;
+                line << L"Backface wall line(s) " << FormatObjectTypeList(awayFacingBackfaceCandidates)
+                     << L" face away from the player-reachable room. 'Apply Safe Fixes' flips these reverse duplicates toward the playable side; if this was an intentionally open/unfinished area, choose Save Anyway.";
+                addSuggestion(L"[WARN]", line.str());
+            }
+            if (!awayFacingWallFlipCandidates.empty())
+            {
+                std::wstringstream line;
+                line << L"Single wall line(s) " << FormatObjectTypeList(awayFacingWallFlipCandidates)
+                     << L" face away from the playable side. 'Apply Safe Fixes' flips them without deleting zones.";
                 addSuggestion(L"[WARN]", line.str());
             }
 
@@ -12722,6 +14203,35 @@ namespace
             }
         }
 
+        for (int eventSlot : sections.safeClearTriggerlessEventSlots)
+        {
+            const int eventIndex = eventSlot - 1;
+            if (eventIndex > kInitialEventIndex && eventIndex < static_cast<int>(g_app.document.events.size()) && !EventHasActiveTrigger(eventIndex))
+            {
+                auto& script = g_app.document.events[static_cast<size_t>(eventIndex)];
+                if (!script.hasUnsupportedRaw && !script.commands.empty())
+                {
+                    script.commands.clear();
+                    script.rawBytes.clear();
+                    ++fixedCount;
+                }
+            }
+        }
+
+        fixedCount += RemoveAwayFacingBackfaceWalls(sections.safeRemoveAwayFacingBackfaces);
+
+        // Removing reverse/backface duplicates changes zone indices and can turn
+        // the remaining physical wall into a normal single-sided wall. Recompute
+        // the facing pass after removals instead of trusting stale pre-delete
+        // indices, otherwise some transparent/outside-facing walls survive.
+        std::vector<int> flipCandidates = sections.safeFlipAwayFacingWalls;
+        const std::vector<int> freshFlipCandidates = FindAwayFacingWallFlipCandidates();
+        for (int zoneIndex : freshFlipCandidates)
+        {
+            AddSortedUniqueInt(flipCandidates, zoneIndex);
+        }
+        fixedCount += FlipAwayFacingWalls(flipCandidates);
+
         if (fixedCount <= 0)
         {
             return false;
@@ -12778,7 +14288,23 @@ namespace
         }
         if (sections.HasSafeRepairs())
         {
-            ss << L"\nSafe fixes available: Move-Wallblock target guides will be made invisible and AI/collision-neutral.";
+            ss << L"\nSafe fixes available:";
+            if (!sections.safeNeutralGuideZones.empty())
+            {
+                ss << L"\n- Move-Wallblock target guides will be made invisible and AI/collision-neutral.";
+            }
+            if (!sections.safeClearTriggerlessEventSlots.empty())
+            {
+                ss << L"\n- Orphaned event slot commands will be cleared.";
+            }
+            if (!sections.safeRemoveAwayFacingBackfaces.empty())
+            {
+                ss << L"\n- Away-facing Backface duplicate wall lines will be flipped toward playable space.";
+            }
+            if (!sections.safeFlipAwayFacingWalls.empty())
+            {
+                ss << L"\n- Away-facing wall lines will be flipped toward playable space.";
+            }
         }
         else
         {
@@ -13068,21 +14594,37 @@ namespace
             return true;
         }
 
-        MapValidationReportSections sections = BuildMapValidationReportSections();
-        if (!sections.HasSaveWarnings())
+        // Some safe fixes delete zones and therefore shift later indices. Re-run
+        // validation after applying fixes so a second pass can catch newly exposed
+        // single-sided walls or remaining backfaces.  Save Anyway still exits the
+        // loop immediately for unfinished/open maps.
+        for (int pass = 0; pass < 3; ++pass)
         {
-            return true;
+            MapValidationReportSections sections = BuildMapValidationReportSections();
+            if (!sections.HasSaveWarnings())
+            {
+                return true;
+            }
+
+            const SaveValidationAction action = AskSaveValidationAction(sections);
+            if (action == SaveValidationAction::Cancel)
+            {
+                return false;
+            }
+            if (action == SaveValidationAction::SaveAnyway)
+            {
+                return true;
+            }
+            if (action == SaveValidationAction::SaveWithSafeFixes)
+            {
+                if (!ApplySafeValidationRepairsNoPrompt(sections, true))
+                {
+                    return true;
+                }
+                continue;
+            }
         }
 
-        const SaveValidationAction action = AskSaveValidationAction(sections);
-        if (action == SaveValidationAction::Cancel)
-        {
-            return false;
-        }
-        if (action == SaveValidationAction::SaveWithSafeFixes)
-        {
-            ApplySafeValidationRepairsNoPrompt(sections, true);
-        }
         return true;
     }
 
@@ -13094,10 +14636,28 @@ namespace
         }
 
         std::wstringstream question;
-        question << L"Apply safe repairs now?\n\n"
-                 << L"This will make these Move-Wallblock target guide zones invisible and AI/collision-neutral:\n"
-                 << FormatObjectTypeList(state->sections.safeNeutralGuideZones)
-                 << L"\n\nOther warnings will only stay as suggestions because they need a design decision.";
+        question << L"Apply safe repairs now?\n\n";
+        if (!state->sections.safeNeutralGuideZones.empty())
+        {
+            question << L"Move-Wallblock target guide zones will be made invisible and AI/collision-neutral:\n"
+                     << FormatObjectTypeList(state->sections.safeNeutralGuideZones) << L"\n\n";
+        }
+        if (!state->sections.safeClearTriggerlessEventSlots.empty())
+        {
+            question << L"Orphaned event slot command(s) with no trigger will be cleared:\n"
+                     << FormatObjectTypeList(state->sections.safeClearTriggerlessEventSlots) << L"\n\n";
+        }
+        if (!state->sections.safeRemoveAwayFacingBackfaces.empty())
+        {
+            question << L"Away-facing Backface wall line(s) will be flipped toward playable space:\n"
+                     << FormatObjectTypeList(state->sections.safeRemoveAwayFacingBackfaces) << L"\n\n";
+        }
+        if (!state->sections.safeFlipAwayFacingWalls.empty())
+        {
+            question << L"Away-facing wall line(s) will be flipped:\n"
+                     << FormatObjectTypeList(state->sections.safeFlipAwayFacingWalls) << L"\n\n";
+        }
+        question << L"Other warnings will only stay as suggestions because they need a design decision.";
         if (MessageBoxW(owner, question.str().c_str(), L"Validate Map", MB_YESNO | MB_ICONQUESTION) != IDYES)
         {
             return false;
@@ -14620,6 +16180,7 @@ namespace
     void ScrollCanvasBy(HWND hwnd, int bar, int request, int trackPos)
     {
         if (!hwnd) return;
+        g_app.allowFreeCanvasPan = false;
         RECT rc{};
         GetClientRect(hwnd, &rc);
         const mapfmt::Bounds rawBounds = g_app.document.ComputeBounds();
@@ -15177,10 +16738,9 @@ namespace
 
     void CleanupWallsForGameplaySave()
     {
-        // Normalize front/back wall pairs and same-line wall chains before writing
-        // the map. This is intentionally conservative: it does not alter non-wall
-        // zones and it ignores the visual backfaces while making collision-facing
-        // decisions.
+        // Normalize same-line wall chains before writing. Existing legacy
+        // backfaces are synced if they already exist, but v26 never creates
+        // new backface duplicates for ordinary walls.
         for (int i = 0; i < static_cast<int>(g_app.document.zones.size()); ++i)
         {
             if (IsVisualBackfaceWallIndex(i))
@@ -15192,7 +16752,7 @@ namespace
             {
                 mapfmt::RecalculateWallMetadata(g_app.document.zones[i]);
                 UpdateWallTextureBandCountFromLength(g_app.document.zones[i]);
-                EnsureBackfaceForWallAtIndex(i);
+                SyncExistingBackfaceWallFromFront(i);
             }
         }
     }
@@ -15248,6 +16808,15 @@ namespace
         }
 
         g_app.document.zones[backIndex] = MakeBackfaceWallFromFront(front);
+    }
+
+    void SyncExistingBackfaceWallFromFront(int frontIndex)
+    {
+        const int backface = FindReverseWallPairIndex(frontIndex);
+        if (backface >= 0)
+        {
+            SyncBackfaceWallFromFront(frontIndex, backface);
+        }
     }
 
     void EnsureBackfaceForWallAtIndex(int zoneIndex)
@@ -15317,6 +16886,38 @@ namespace
         if (reverseScore > keepScore)
         {
             ReverseWallDirectionPreservingTexture(zone);
+        }
+    }
+
+    double PointDistanceSq(POINT a, POINT b)
+    {
+        const double dx = static_cast<double>(a.x) - static_cast<double>(b.x);
+        const double dz = static_cast<double>(a.y) - static_cast<double>(b.y);
+        return dx * dx + dz * dz;
+    }
+
+    void RestoreDrawnWallDirection(int zoneIndex, POINT drawnStart, POINT drawnEnd)
+    {
+        if (zoneIndex < 0 || zoneIndex >= static_cast<int>(g_app.document.zones.size()))
+        {
+            return;
+        }
+
+        auto& zone = g_app.document.zones[zoneIndex];
+        if (zone.ztype != static_cast<int>(mapfmt::ZoneType::Wall))
+        {
+            return;
+        }
+
+        const POINT currentStart{ static_cast<LONG>(zone.x1), static_cast<LONG>(zone.z1) };
+        const POINT currentEnd{ static_cast<LONG>(zone.x2), static_cast<LONG>(zone.z2) };
+        const double keepScore = PointDistanceSq(currentStart, drawnStart) + PointDistanceSq(currentEnd, drawnEnd);
+        const double reverseScore = PointDistanceSq(currentEnd, drawnStart) + PointDistanceSq(currentStart, drawnEnd);
+
+        if (reverseScore < keepScore)
+        {
+            ReverseWallDirectionPreservingTexture(zone);
+            UpdateWallTextureBandCountFromLength(zone);
         }
     }
 
@@ -15473,7 +17074,8 @@ namespace
                 OrientWallForConnectedEndpoints(g_app.selectedZone);
             }
             NormalizeCollinearConnectedWallsAroundZone(g_app.selectedZone);
-            EnsureBackfaceForWallAtIndex(g_app.selectedZone);
+            RestoreDrawnWallDirection(g_app.selectedZone, g_app.drawStartWorld, g_app.drawCurrentWorld);
+            // v26: newly drawn walls stay single-sided; the 3D preview renders them two-sided.
             if (g_app.selectedZone >= 0 && g_app.selectedZone < static_cast<int>(g_app.document.zones.size()))
             {
                 const auto& finalZone = g_app.document.zones[g_app.selectedZone];
@@ -15806,6 +17408,50 @@ namespace
         return L"Select a wall, trigger, object or teleport target, or choose a drawing/link tool on the left.";
     }
 
+    void FillAlphaRect(HDC hdc, const RECT& rect, COLORREF color, BYTE alpha)
+    {
+        if (rect.right <= rect.left || rect.bottom <= rect.top)
+        {
+            return;
+        }
+
+        HDC sourceDc = CreateCompatibleDC(hdc);
+        if (!sourceDc)
+        {
+            HBRUSH fallback = CreateSolidBrush(color);
+            FillRect(hdc, &rect, fallback);
+            DeleteObject(fallback);
+            return;
+        }
+
+        const int width = rect.right - rect.left;
+        const int height = rect.bottom - rect.top;
+        HBITMAP bitmap = CreateCompatibleBitmap(hdc, width, height);
+        if (!bitmap)
+        {
+            DeleteDC(sourceDc);
+            HBRUSH fallback = CreateSolidBrush(color);
+            FillRect(hdc, &rect, fallback);
+            DeleteObject(fallback);
+            return;
+        }
+
+        HGDIOBJ oldBitmap = SelectObject(sourceDc, bitmap);
+        RECT sourceRect{ 0, 0, width, height };
+        HBRUSH brush = CreateSolidBrush(color);
+        FillRect(sourceDc, &sourceRect, brush);
+        DeleteObject(brush);
+
+        BLENDFUNCTION blend{};
+        blend.BlendOp = AC_SRC_OVER;
+        blend.SourceConstantAlpha = alpha;
+        AlphaBlend(hdc, rect.left, rect.top, width, height, sourceDc, 0, 0, width, height, blend);
+
+        SelectObject(sourceDc, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(sourceDc);
+    }
+
     void DrawCanvasTextOverlayBox(HDC hdc, const RECT& rc, const std::wstring& text, bool bottomLeft)
     {
         if (text.empty() || rc.right - rc.left < 120 || rc.bottom - rc.top < 80)
@@ -15827,12 +17473,9 @@ namespace
         SIZE oneLine{};
         GetTextExtentPoint32W(hdc, text.c_str(), static_cast<int>(text.size()), &oneLine);
 
-        // Prefer one line and only wrap when the canvas is too narrow.
+        // Prefer one line and keep the box only as wide as the text.
         int wantedRight = MinValue(maxRight, left + padX + oneLine.cx + padX);
-        if (wantedRight < left + 120)
-        {
-            wantedRight = maxRight;
-        }
+        wantedRight = MaxValue(wantedRight, left + 80);
 
         RECT measure{ left + padX, 0, wantedRight - padX, rc.bottom };
         DrawTextW(hdc, text.c_str(), -1, &measure, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
@@ -15848,9 +17491,7 @@ namespace
             : rc.top + margin;
         RECT box{ left, top, wantedRight, MinValue(rc.bottom - margin, top + boxHeight) };
 
-        HBRUSH bg = CreateSolidBrush(RGB(22, 22, 26));
-        FillRect(hdc, &box, bg);
-        DeleteObject(bg);
+        FillAlphaRect(hdc, box, RGB(22, 22, 26), 204);
 
         HPEN border = CreatePen(PS_SOLID, 1, RGB(58, 58, 66));
         HGDIOBJ oldPen = SelectObject(hdc, border);
@@ -15872,9 +17513,95 @@ namespace
 
     void DrawCanvasQuickHelpOverlay(HDC hdc, const RECT& rc)
     {
-        DrawCanvasTextOverlayBox(hdc, rc,
-            L"ESC ends current task | SPACE + Left Mouse drags the map | Right Mouse places 3D viewpoint on map",
-            true);
+        constexpr int margin = 8;
+        constexpr int padX = 10;
+        constexpr int padY = 8;
+        constexpr int titleGap = 4;
+
+        const std::wstring title = L"How to use the Editor?";
+        const std::wstring line1 = L"ESC ends current task | SPACE + Left Mouse drags the map | Right Mouse places 3D viewpoint on map";
+        const std::wstring line2 = L"END sets wall to ignore for validation | POS1 centers map on screen";
+
+        const int left = rc.left + margin;
+        const int maxRight = rc.right - margin;
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(hdc, &tm);
+        const int baseLineHeight = MaxValue(16, tm.tmHeight + tm.tmExternalLeading);
+
+        LOGFONTW lf{};
+        HFONT currentFont = reinterpret_cast<HFONT>(GetCurrentObject(hdc, OBJ_FONT));
+        if (currentFont)
+        {
+            GetObjectW(currentFont, sizeof(lf), &lf);
+        }
+        else
+        {
+            lf.lfHeight = -14;
+            wcscpy_s(lf.lfFaceName, L"Segoe UI");
+        }
+        lf.lfWeight = FW_SEMIBOLD;
+        HFONT titleFont = CreateFontIndirectW(&lf);
+        HGDIOBJ oldFont = titleFont ? SelectObject(hdc, titleFont) : nullptr;
+
+        RECT titleMeasure{ 0, 0, maxRight - left - padX * 2, rc.bottom };
+        DrawTextW(hdc, title.c_str(), -1, &titleMeasure, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_CALCRECT);
+        const int titleHeight = MaxValue(baseLineHeight, titleMeasure.bottom - titleMeasure.top);
+        const int titleWidth = MaxValue(0, titleMeasure.right - titleMeasure.left);
+
+        if (titleFont && oldFont)
+        {
+            SelectObject(hdc, oldFont);
+        }
+
+        std::wstring helpLines = line1 + L"\n" + line2;
+        SIZE line1Size{};
+        SIZE line2Size{};
+        GetTextExtentPoint32W(hdc, line1.c_str(), static_cast<int>(line1.size()), &line1Size);
+        GetTextExtentPoint32W(hdc, line2.c_str(), static_cast<int>(line2.size()), &line2Size);
+        const int textWantedWidth = MaxValue(titleWidth, MaxValue(line1Size.cx, line2Size.cx));
+        int wantedRight = MinValue(maxRight, left + padX + textWantedWidth + padX);
+        wantedRight = MaxValue(wantedRight, left + 80);
+
+        RECT lineMeasure{ left + padX, 0, wantedRight - padX, rc.bottom };
+        DrawTextW(hdc, helpLines.c_str(), -1, &lineMeasure, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
+        const int linesHeight = MaxValue(baseLineHeight * 2, lineMeasure.bottom - lineMeasure.top);
+
+        const int boxHeight = padY * 2 + titleHeight + titleGap + linesHeight;
+        const int top = MaxValue(rc.top + margin, rc.bottom - margin - boxHeight);
+        RECT box{ left, top, wantedRight, MinValue(rc.bottom - margin, top + boxHeight) };
+
+        FillAlphaRect(hdc, box, RGB(22, 22, 26), 204);
+
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(58, 58, 66));
+        HGDIOBJ oldPen = SelectObject(hdc, border);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(hdc, box.left, box.top, box.right, box.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(border);
+
+        SetBkMode(hdc, TRANSPARENT);
+
+        RECT titleRc{ box.left + padX, box.top + padY, box.right - padX, box.top + padY + titleHeight };
+        if (titleFont)
+        {
+            oldFont = SelectObject(hdc, titleFont);
+        }
+        SetTextColor(hdc, kDarkText);
+        DrawTextW(hdc, title.c_str(), -1, &titleRc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (titleFont && oldFont)
+        {
+            SelectObject(hdc, oldFont);
+        }
+        if (titleFont)
+        {
+            DeleteObject(titleFont);
+        }
+
+        RECT textRc{ box.left + padX, titleRc.bottom + titleGap, box.right - padX, box.bottom - padY };
+        SetTextColor(hdc, kDarkMutedText);
+        DrawTextW(hdc, helpLines.c_str(), -1, &textRc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
     }
 
     void PaintCanvas(HWND hwnd)
@@ -15982,14 +17709,22 @@ namespace
             if (zone.ztype == static_cast<int>(mapfmt::ZoneType::Wall))
             {
                 const bool moveGuideWall = (zone.a == 0 && zone.b == 0);
+                const bool ignoredWall = IsZoneValidationIgnored(i);
+                const COLORREF normalWallColor = ignoredWall ? RGB(190, 96, 255) : RGB(96, 170, 255);
+                const COLORREF selectedWallColor = ignoredWall ? RGB(232, 176, 255) : RGB(255, 220, 64);
                 HPEN pen = CreatePen(moveGuideWall ? PS_DOT : PS_SOLID, selected ? 4 : 2,
-                    selected ? RGB(255, 220, 64) : (moveGuideWall ? RGB(115, 135, 160) : RGB(96, 170, 255)));
+                    selected ? selectedWallColor : (moveGuideWall ? RGB(115, 135, 160) : normalWallColor));
                 HPEN prev = static_cast<HPEN>(SelectObject(hdc, pen));
                 MoveToEx(hdc, p1.x, p1.y, nullptr);
                 LineTo(hdc, p2.x, p2.y);
 
                 SelectObject(hdc, prev);
                 DeleteObject(pen);
+
+                if (!moveGuideWall && !IsVisualBackfaceWallIndex(i))
+                {
+                    DrawWallFacingArrow(hdc, rc, bounds, zone, selected);
+                }
 
                 if (selected)
                 {
@@ -16142,6 +17877,10 @@ namespace
             {
                 MoveToEx(hdc, p1.x, p1.y, nullptr);
                 LineTo(hdc, p2.x, p2.y);
+                if (previewZone.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall))
+                {
+                    DrawWallFacingArrow(hdc, rc, bounds, previewZone, true);
+                }
             }
             else
             {
@@ -16461,10 +18200,10 @@ namespace
             return false;
         }
 
-        // Editor-created two-sided walls contain a reverse visual backface.
-        // Rendering/colliding both halves makes the 3D preview look like there
-        // is a second wall beside the real wall.  Keep the canonical/front wall
-        // only; the actual game data still keeps both sides where needed.
+        // The editor preview intentionally renders walls two-sided: wall
+        // direction/front-side mistakes should not make surfaces disappear in
+        // the 3D view.  For editor-created visual backface pairs, render only
+        // the canonical physical line to avoid z-fighting/double hits.
         return !IsVisualBackfaceWallIndex(zoneIndex);
     }
 
@@ -17783,14 +19522,14 @@ namespace
         }
 
         g_app.activeWallTextureMode = newMode;
-        if (IsSelectedWall() && !(g_app.insertMode == InsertMode::Wall && g_app.isDrawing))
+        if (IsSelectedWall() && g_app.insertMode != InsertMode::Wall)
         {
             NormalizeSelectedWallToCanonical();
             PushUndoSnapshot();
             auto& zone = g_app.document.zones[g_app.selectedZone];
             ApplyWallTextureModeToZone(zone, newMode);
             NormalizeCollinearConnectedWallsAroundZone(g_app.selectedZone);
-            EnsureBackfaceForWallAtIndex(g_app.selectedZone);
+            SyncExistingBackfaceWallFromFront(g_app.selectedZone);
             MarkDirty();
             RefreshZoneList();
         }
@@ -17808,7 +19547,7 @@ namespace
 
         auto applyToSelectedWallIfNeeded = [&]()
         {
-            if (!IsSelectedWall() || (g_app.insertMode == InsertMode::Wall && g_app.isDrawing))
+            if (!IsSelectedWall() || g_app.insertMode == InsertMode::Wall)
             {
                 return false;
             }
@@ -17818,7 +19557,7 @@ namespace
             auto& zone = g_app.document.zones[g_app.selectedZone];
             ApplyActiveWallTextureToZoneBand(zone, GetActiveTextureBandForZone(zone));
             NormalizeCollinearConnectedWallsAroundZone(g_app.selectedZone);
-            EnsureBackfaceForWallAtIndex(g_app.selectedZone);
+            SyncExistingBackfaceWallFromFront(g_app.selectedZone);
             MarkDirty();
             RefreshZoneList();
             // Keep the right-hand picker on the actually clicked strip after
@@ -18167,6 +19906,7 @@ namespace
                 SetFocus(hwnd);
                 SetCapture(hwnd);
                 g_app.isPanning = true;
+                g_app.allowFreeCanvasPan = true;
                 g_app.isDrawing = false;
                 g_app.drawWallAngleLock = false;
                 g_app.drawWallLengthSnapLock = false;
@@ -18398,6 +20138,7 @@ namespace
                 const int dy = GET_Y_LPARAM(lParam) - g_app.panStartClient.y;
                 g_app.viewCenterX = g_app.panStartCenterX - static_cast<double>(dx) / metrics.scale;
                 g_app.viewCenterZ = g_app.panStartCenterZ + static_cast<double>(dy) / metrics.scale;
+                g_app.allowFreeCanvasPan = true;
                 g_app.viewInitialized = true;
                 ClampViewCenterToDocument(g_app.document.ComputeBounds());
                 UpdateCanvasScrollBars(hwnd);
@@ -18536,6 +20277,9 @@ namespace
             const double afterWorldZ = afterMetrics.centerWorldZ - (static_cast<double>(clientPt.y) - afterMetrics.centerPixelY) / afterMetrics.scale;
             g_app.viewCenterX += beforeWorldX - afterWorldX;
             g_app.viewCenterZ += beforeWorldZ - afterWorldZ;
+            // Preserve any free SPACE-pan offset while zooming with the mouse wheel.
+            // The scrollbar thumb may already be at its visual edge, but the canvas
+            // center must not snap back to that clamped scrollbar position.
             g_app.viewInitialized = true;
             ClampViewCenterToDocument(rawBounds);
             UpdateCanvasScrollBars(hwnd);
@@ -18699,7 +20443,8 @@ namespace
                 }
                 SendMessageW(icon, STM_SETICON, reinterpret_cast<WPARAM>(appIcon), 0);
 
-                HWND title = CreateWindowW(L"STATIC", L"ZGLOOM Level Editor",
+                const std::wstring aboutTitleText = std::wstring(kEditorProductName) + L" " + kEditorVersionText;
+                HWND title = CreateWindowW(L"STATIC", aboutTitleText.c_str(),
                     WS_CHILD | WS_VISIBLE,
                     86, 20, 420, 24, hwnd, nullptr, g_app.instance, nullptr);
                 HWND subtitle = CreateWindowW(L"STATIC", L"Standalone Win32 Editor for Gloom maps",
@@ -18852,8 +20597,10 @@ namespace
             owner, nullptr, g_app.instance, nullptr);
         if (!dialog)
         {
+            const std::wstring fallbackMessage = std::wstring(kEditorProductName) + L" " + kEditorVersionText +
+                L"\nStandalone Win32 Editor for Gloom maps\n\nThis editor allows you to edit and create level maps for Gloom, Gloom Deluxe, and related games. The level editor was built to the best of our knowledge and belief, with a focus on user-friendliness and intuitive operation.\n\nDesign, UI and coding by A. Stürmer / @andiweli\nMore projects on https://andiweli.github.io";
             MessageBoxW(owner,
-                L"ZGLOOM Level Editor\nStandalone Win32 Editor for Gloom maps\n\nThis editor allows you to edit and create level maps for Gloom, Gloom Deluxe, and related games. The level editor was built to the best of our knowledge and belief, with a focus on user-friendliness and intuitive operation.\n\nDesign, UI and coding by A. St\u00FCrmer / @andiweli\nMore projects on https://andiweli.github.io",
+                fallbackMessage.c_str(),
                 L"Information", MB_OK | MB_ICONINFORMATION);
             return;
         }

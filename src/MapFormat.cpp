@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <utility>
 
 namespace
 {
@@ -231,6 +233,232 @@ namespace
                b.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
                a.x1 == b.x2 && a.z1 == b.z2 &&
                a.x2 == b.x1 && a.z2 == b.z1;
+    }
+
+
+    bool ExactSameDirectionWallLine(const mapfmt::Zone& a, const mapfmt::Zone& b)
+    {
+        return a.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+               b.ztype == static_cast<int16_t>(mapfmt::ZoneType::Wall) &&
+               a.x1 == b.x1 && a.z1 == b.z1 &&
+               a.x2 == b.x2 && a.z2 == b.z2;
+    }
+
+    bool HasExactReverseWallPairs(const std::vector<mapfmt::Zone>& zones)
+    {
+        for (size_t i = 0; i < zones.size(); ++i)
+        {
+            if (zones[i].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall))
+            {
+                continue;
+            }
+            for (size_t j = i + 1; j < zones.size(); ++j)
+            {
+                if (ExactReverseWallPair(zones[i], zones[j]))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    std::vector<std::pair<int, int>> CollectGameplaySamplePoints(
+        const std::array<mapfmt::EventScript, mapfmt::MapDocument::kEventCount>& scripts)
+    {
+        std::vector<std::pair<int, int>> samples;
+        samples.reserve(64);
+        for (const auto& script : scripts)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+            for (const auto& command : script.commands)
+            {
+                if (command.type == mapfmt::CommandType::AddMonster)
+                {
+                    samples.emplace_back(static_cast<int>(command.params[1]), static_cast<int>(command.params[3]));
+                }
+                else if (command.type == mapfmt::CommandType::Teleport)
+                {
+                    samples.emplace_back(static_cast<int>(command.params[0]), static_cast<int>(command.params[2]));
+                }
+            }
+        }
+        return samples;
+    }
+
+    std::vector<uint8_t> BuildEventControlledWallMask(
+        const std::array<mapfmt::EventScript, mapfmt::MapDocument::kEventCount>& scripts,
+        size_t zoneCount)
+    {
+        std::vector<uint8_t> mask(zoneCount, 0);
+        for (const auto& script : scripts)
+        {
+            if (script.hasUnsupportedRaw)
+            {
+                continue;
+            }
+            for (const auto& command : script.commands)
+            {
+                if (command.type == mapfmt::CommandType::OpenDoor ||
+                    command.type == mapfmt::CommandType::ChangeTexture)
+                {
+                    const int index = static_cast<int>(command.params[0]);
+                    if (index >= 0 && index < static_cast<int>(zoneCount))
+                    {
+                        mask[static_cast<size_t>(index)] = 1;
+                    }
+                }
+                else if (command.type == mapfmt::CommandType::RotatePoly)
+                {
+                    const int first = static_cast<int>(command.params[0]);
+                    const int count = std::max(1, static_cast<int>(command.params[1]));
+                    for (int i = 0; i < count; ++i)
+                    {
+                        const int index = first + i;
+                        if (index >= 0 && index < static_cast<int>(zoneCount))
+                        {
+                            mask[static_cast<size_t>(index)] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        return mask;
+    }
+
+    double ScoreWallFacingGameplaySide(
+        const mapfmt::Zone& zone,
+        const std::vector<std::pair<int, int>>& samples)
+    {
+        if (samples.empty())
+        {
+            return 0.0;
+        }
+
+        const double midX = (static_cast<double>(zone.x1) + static_cast<double>(zone.x2)) * 0.5;
+        const double midZ = (static_cast<double>(zone.z1) + static_cast<double>(zone.z2)) * 0.5;
+        const double normalX = static_cast<double>(zone.a);
+        const double normalZ = static_cast<double>(zone.b);
+
+        double score = 0.0;
+        for (const auto& sample : samples)
+        {
+            const double sx = static_cast<double>(sample.first) - midX;
+            const double sz = static_cast<double>(sample.second) - midZ;
+            const double dot = sx * normalX + sz * normalZ;
+            const double distSq = std::max(4096.0, sx * sx + sz * sz);
+
+            // Shipped Gloom maps consistently place gameplay objects mostly on
+            // the negative side of a wall's (a,b) side vector.  Editor-created
+            // visual backfaces are the exact reverse of the collision wall; if
+            // the grid keeps the wrong side, the wall is visible from outside but
+            // the player side clips/sticks.  Weight nearby samples heavily but do
+            // not require a sample inside the same room.
+            if (dot < 0.0)
+            {
+                score += 1.0 / distSq;
+            }
+            else if (dot > 0.0)
+            {
+                score -= 0.25 / distSq;
+            }
+        }
+        return score;
+    }
+
+    std::vector<int> BuildOriginalStyleActiveWallGridIndexMap(
+        const std::vector<mapfmt::Zone>& zones,
+        const std::array<mapfmt::EventScript, mapfmt::MapDocument::kEventCount>& scripts)
+    {
+        std::vector<int> active(zones.size(), -1);
+        for (size_t i = 0; i < zones.size(); ++i)
+        {
+            active[i] = static_cast<int>(i);
+        }
+
+        const std::vector<std::pair<int, int>> samples = CollectGameplaySamplePoints(scripts);
+        const std::vector<uint8_t> eventControlled = BuildEventControlledWallMask(scripts, zones.size());
+        std::vector<uint8_t> consumed(zones.size(), 0);
+
+        for (size_t i = 0; i < zones.size(); ++i)
+        {
+            if (consumed[i] || zones[i].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall))
+            {
+                continue;
+            }
+
+            int best = static_cast<int>(i);
+            bool foundPair = false;
+            for (size_t j = i + 1; j < zones.size(); ++j)
+            {
+                if (consumed[j] || zones[j].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall))
+                {
+                    continue;
+                }
+                if (!ExactReverseWallPair(zones[i], zones[j]))
+                {
+                    continue;
+                }
+
+                foundPair = true;
+
+                const bool iControlled = i < eventControlled.size() && eventControlled[i] != 0;
+                const bool jControlled = j < eventControlled.size() && eventControlled[j] != 0;
+                if (iControlled != jControlled)
+                {
+                    best = iControlled ? static_cast<int>(i) : static_cast<int>(j);
+                }
+                else
+                {
+                    const double iScore = ScoreWallFacingGameplaySide(zones[i], samples);
+                    const double jScore = ScoreWallFacingGameplaySide(zones[j], samples);
+                    if (jScore > iScore)
+                    {
+                        best = static_cast<int>(j);
+                    }
+                }
+
+                active[i] = best;
+                active[j] = best;
+                consumed[i] = 1;
+                consumed[j] = 1;
+                break;
+            }
+
+            if (!foundPair)
+            {
+                consumed[i] = 1;
+            }
+        }
+
+        // Same-direction duplicates are never useful in the original grid either.
+        // Keep one representative, preferably the event-controlled one.
+        for (size_t i = 0; i < zones.size(); ++i)
+        {
+            if (zones[i].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall))
+            {
+                continue;
+            }
+            for (size_t j = i + 1; j < zones.size(); ++j)
+            {
+                if (zones[j].ztype != static_cast<int16_t>(mapfmt::ZoneType::Wall) ||
+                    !ExactSameDirectionWallLine(zones[i], zones[j]))
+                {
+                    continue;
+                }
+
+                const bool iControlled = i < eventControlled.size() && eventControlled[i] != 0;
+                const bool jControlled = j < eventControlled.size() && eventControlled[j] != 0;
+                const int best = (jControlled && !iControlled) ? static_cast<int>(j) : static_cast<int>(i);
+                active[i] = best;
+                active[j] = best;
+            }
+        }
+
+        return active;
     }
 
     bool CollisionGridContainsZone(const std::array<mapfmt::MapDocument::CollisionPlane, 2>& grid, uint16_t zoneIndex)
@@ -916,12 +1144,16 @@ namespace mapfmt
             }
         };
 
+        const std::vector<int> activeWallGridIndex = BuildOriginalStyleActiveWallGridIndexMap(saveZones, eventsToWrite);
+        const bool hasEditorReverseWallPairs = HasExactReverseWallPairs(saveZones);
+
         // Start with the original Amiga grid when available and sane. This grid is
         // used by the original Gloom/Gloom Deluxe engine not only for
         // blocking/collision, but also for visibility/render lookup. Preserve exact
-        // shipped cell coverage, but rebuild grids created by older editor builds
-        // when they are overcrowded or lost one half of exact backface pairs.
-        const bool preserveOriginalGrid = hasCollisionGrid &&
+        // shipped cell coverage for real original maps. Editor-created visual
+        // backfaces are rebuilt into an original-style single active wall side.
+        const bool preserveOriginalGrid = !hasEditorReverseWallPairs &&
+            hasCollisionGrid &&
             CollisionGridLooksAmigaSafe(collisionGrid, saveZones);
 
         if (preserveOriginalGrid)
@@ -977,12 +1209,19 @@ namespace mapfmt
                     continue;
                 }
 
-                // Amiga-compatible export for new/edited walls. Do not use the
-                // old broad rectangle expansion here: it can put 20+ walls into a
-                // single small-map cell, while original Amiga maps commonly keep
-                // wall lists very small. Real Gloom Deluxe then may skip render
-                // entries while collision still blocks. Follow the line itself and
-                // include exact reverse/backface zones as their own entries.
+                if (zoneIndex < activeWallGridIndex.size() &&
+                    activeWallGridIndex[zoneIndex] >= 0 &&
+                    activeWallGridIndex[zoneIndex] != static_cast<int>(zoneIndex))
+                {
+                    // Editor-created backface pairs remain in the zone block for
+                    // editor compatibility, but the real game grid must reference
+                    // only one side of each physical wall, just like the shipped
+                    // Amiga maps.  The chosen side is the one facing gameplay.
+                    continue;
+                }
+
+                // Amiga-compatible export for new/edited walls. Do not use broad
+                // rectangle expansion: it overcrowds cells and exposes seam bugs.
                 addLineZoneToGrid(0, zone, static_cast<uint16_t>(zoneIndex));
                 continue;
             }
