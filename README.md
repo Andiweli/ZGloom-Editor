@@ -1,10 +1,8 @@
 # 🧱 ZGloom Editor
 
-<p align="left">
-  <img alt="platform" src="https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue?style=flat" />
-  <img alt="ide" src="https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
-
-</p>
+![Platform](https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue)
+![IDE](https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio)
+![AI](https://img.shields.io/badge/AI-assisted%20coding-6e7781)
 
 **Gloom Level Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.  
 The goal is to provide a practical desktop tool for inspecting, editing and exporting map data while keeping the workflow close to the original Gloom/ZGloom structure.*  
