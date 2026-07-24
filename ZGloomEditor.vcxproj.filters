@@ -24,6 +24,9 @@
     <ClCompile Include="src\CampaignEditor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\EhbExport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\MapFormat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -33,6 +36,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\CampaignEditor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\EhbExport.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\MapFormat.h">

@@ -1,4 +1,5 @@
-#include "CampaignEditor.h"
+﻿#include "CampaignEditor.h"
+#include "EhbExport.h"
 
 #include "decrunchmania.h"
 #include "resource.h"
@@ -8456,6 +8457,79 @@ namespace
         ShowTextureManager(owner);
     }
 
+    bool BrowseOpenEhbSource(HWND owner, fs::path& outPath)
+    {
+        std::array<wchar_t, 32768> fileName{};
+        const wchar_t filter[] =
+            L"PNG or ILBM image (*.png;*.iff;*.ilbm)\0*.png;*.iff;*.ilbm\0"
+            L"All files (*.*)\0*.*\0\0";
+
+        std::wstring initialFolder;
+        if (g_profile.valid)
+            initialFolder = g_profile.root.wstring();
+
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = filter;
+        ofn.lpstrFile = fileName.data();
+        ofn.nMaxFile = static_cast<DWORD>(fileName.size());
+        ofn.lpstrInitialDir = initialFolder.empty() ? nullptr : initialFolder.c_str();
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY;
+        if (!GetOpenFileNameW(&ofn))
+            return false;
+
+        outPath = fs::path(fileName.data());
+        return true;
+    }
+
+
+    void ExportEhbResources(HWND owner)
+    {
+        if (!EnsureProfile(owner))
+            return;
+
+        std::wstring folder;
+        if (!BrowseFolderWithTitle(owner, L"Select ECS/EHB export target folder", folder))
+            return;
+
+        const EhbExport::Result result = EhbExport::ExportReferenceSet(g_profile.root, fs::path(folder));
+        DarkMessageBox(owner, result.message, L"Amiga ECS/EHB Resources",
+            MB_OK | (result.success ? MB_ICONINFORMATION : MB_ICONERROR));
+    }
+
+    void ExportEcsGraphics(HWND owner)
+    {
+        if (!EnsureProfile(owner))
+            return;
+
+        std::wstring folder;
+        if (!BrowseFolderWithTitle(owner, L"Select ECS graphics export target folder", folder))
+            return;
+
+        const bool composeGloomTitleBrush =
+            g_profile.type == GameType::Gloom || g_profile.type == GameType::GloomDeluxe;
+        const EhbExport::Result result = EhbExport::ExportRetailPictureSet(
+            g_profile.root, g_profile.picturesDir, fs::path(folder), composeGloomTitleBrush);
+        DarkMessageBox(owner, result.message, L"Export ECS/EHB Graphics",
+            MB_OK | (result.success ? MB_ICONINFORMATION : MB_ICONERROR));
+    }
+
+    void ConvertEhbImage(HWND owner)
+    {
+        fs::path source;
+        if (!BrowseOpenEhbSource(owner, source))
+            return;
+
+        std::wstring folder;
+        if (!BrowseFolderWithTitle(owner, L"Select pics_ehb output folder", folder))
+            return;
+
+        const EhbExport::Result result = EhbExport::ConvertImageFile(source, fs::path(folder));
+        DarkMessageBox(owner, result.message, L"Convert PNG/ILBM to Amiga ECS/EHB",
+            MB_OK | (result.success ? MB_ICONINFORMATION : MB_ICONERROR));
+    }
+
     void ExportGamePackage(HWND owner)
     {
         if (!EnsureProfile(owner))
@@ -8510,6 +8584,9 @@ namespace CampaignEditor
             return true;
         case IDM_CAMPAIGN_TITLE_MUSIC:
             TextureAssets(owner);
+            return true;
+        case IDM_CAMPAIGN_FAST_ECS_TITLE:
+            ExportEcsGraphics(owner);
             return true;
         case IDM_CAMPAIGN_EXPORT_GAME_PACKAGE:
             NewCampaign(owner);

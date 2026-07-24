@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #define IDI_APP_ICON                    101
 
@@ -129,5 +129,6 @@
 #define IDM_CAMPAIGN_TITLE_MUSIC          40034
 #define IDM_CAMPAIGN_EXPORT_GAME_PACKAGE  40035
 #define IDM_CAMPAIGN_SETTINGS             40036
+#define IDM_CAMPAIGN_FAST_ECS_TITLE       40037
 #define IDM_FILE_RECENT_FIRST            40100
 #define IDM_FILE_RECENT_LAST             40104

@@ -1,4 +1,4 @@
-#ifndef NOMINMAX
+﻿#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
@@ -85,7 +85,7 @@ namespace
     constexpr UINT kCmdViewEventGraphOverlay = 65014; // local view toggle; keeps resource.h unchanged
 
     constexpr const wchar_t* kEditorProductName = L"ZGLOOM Editor";
-    constexpr const wchar_t* kEditorVersionText = L"1.1.0";
+    constexpr const wchar_t* kEditorVersionText = L"1.2.0";
 
     enum class InsertMode
     {
@@ -15824,6 +15824,8 @@ namespace
         AppendOwnerDrawMenuItem(campaignMenu, IDM_CAMPAIGN_SCRIPT, L"Campaign Script");
         AppendOwnerDrawMenuItem(campaignMenu, IDM_CAMPAIGN_INTERMISSION_SCREENS, L"Title and Intermission Screens");
         AppendOwnerDrawMenuItem(campaignMenu, IDM_CAMPAIGN_TITLE_MUSIC, L"Textures");
+        AppendOwnerDrawSeparator(campaignMenu);
+        AppendOwnerDrawMenuItem(campaignMenu, IDM_CAMPAIGN_FAST_ECS_TITLE, L"Export ECS/EHB Graphics...");
         AppendOwnerDrawSeparator(campaignMenu);
         AppendOwnerDrawMenuItem(campaignMenu, IDM_CAMPAIGN_EXPORT_GAME_PACKAGE, L"New Campaign");
 
