@@ -3,6 +3,8 @@
 ![Platform](https://img.shields.io/badge/platform-Win32%20%2F%20x86-blue)
 ![IDE](https://img.shields.io/badge/IDE-Visual%20Studio-5C2D91?style=flat&logo=visualstudio)
 ![AI](https://img.shields.io/badge/AI-assisted%20coding-6e7781)
+[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal\&logoColor=white)](https://paypal.me/andiweli)
+
 
 **Gloom Level Editor** is a standalone Win32 / x86 Visual Studio editor prototype for creating and editing **Gloom-compatible maps**.  
 The goal is to provide a practical desktop tool for inspecting, editing and exporting map data while keeping the workflow close to the original Gloom/ZGloom structure.*  
@@ -82,6 +84,18 @@ Clearer tool naming such as Wall/Door/Switch
 Separate switch-linking workflow via Link Event > Switch/Trigger
 Better visual feedback when selecting map elements
 Right-side overview area showing selected wall/zone information
+
+---
+
+## ❤️ Support
+
+If you enjoy this project and would like to support my work, you can make a small contribution via PayPal.
+
+Your support helps me spend more time maintaining existing projects, fixing bugs, improving compatibility, and working on new features.
+
+[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal\&logoColor=white)](https://paypal.me/andiweli)
+
+Thank you for your support!
 
 ---
 
